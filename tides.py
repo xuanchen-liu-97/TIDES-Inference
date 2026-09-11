@@ -1,27 +1,47 @@
-"""TIDES: end-to-end orchestration for the four-step inference pipeline.
+"""
+tides.py
+========
+
+Public orchestration / convenience API for TIDES.
 
 TIDES = Temporal Inference and Decomposition via Edge Space.
 
-This module intentionally contains *no new scientific solver logic*.  It only
-connects the four independently callable steps:
+The scientific steps remain independently callable:
 
-    Step 1  detect changes
-    Step 2  infer the admissible structure of each change
-    Step 3  reconstruct the stage-wise edge-resolved vector fields B
-    Step 4  decompose B under a physical source hypothesis
+    Step 1  detect vector-field change times
+    Step 2  infer the structure/support of each change
+    Step 3  reconstruct stage-wise edge-space vector fields B
+    Step 4  decompose B into microscopic sources under a source hypothesis
 
-The same functions can therefore be used manually, while :func:`run_tides`
-provides a convenient full-pipeline entry point.
+Current implemented branch
+--------------------------
+Step 2 change hypothesis:
+    ``varying_structure``
 
-Current scope
--------------
-The currently implemented end-to-end branch is
+with row-sparse changes in unrestricted edge-space coefficients,
 
-    varying structure + shared dynamics
+    Delta B^(k).
 
-for piecewise-stationary systems with locally sparse row changes in ΔB.
-The ``varying_dynamics`` hypothesis is already supported by Step 4, but its
-Step-2 coherent-change backend is deliberately not yet implemented.
+Step 4 source hypothesis:
+    ``shared_interaction_law``
+
+with
+
+    B^(r) = W^(r) theta^T.
+
+Important pipeline note
+-----------------------
+The generic Step-2/3 APIs operate on preprocessed vector-field observations
+
+    Y, D, edge_features, stage_of_sample.
+
+Step 1 acts on the raw trajectory X(t), while the derivative / midpoint
+preprocessing and edge-feature construction between Step 1 and Step 2 are
+data/model-specific.  Therefore ``run_tides`` currently orchestrates Steps
+2--4 from already preprocessed observations.  Step 1 is re-exported and can
+be run independently before that preprocessing stage.
+
+This module contains no scientific solver logic.
 """
 
 from __future__ import annotations
@@ -32,63 +52,101 @@ from typing import Any, Literal, Mapping, Optional, Sequence
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-# Support both usages:
-#   1) package form:     from tides.tides import run_tides
-#   2) flat-file form:   from tides import run_tides
+
+# -----------------------------------------------------------------------------
+# Imports: package form and flat-file form
+# -----------------------------------------------------------------------------
+
 try:  # package-relative imports
-    from .step1_change_detection import ChangeDetectionResult, detect_changes
-    from .step2_change_structure import ChangeStructureResult, infer_change_structure
+    from .step1_change_detection import (
+        ChangeDetectionResult,
+        detect_changes,
+    )
+    from .step2_change_structure import (
+        ChangeStructureResult,
+        infer_change_structure,
+        infer_change_structure_from_observations,
+    )
     from .step3_vector_field import (
-        LibraryFunction,
         VectorFieldReconstructionResult,
         reconstruct_vector_field,
+        reconstruct_vector_field_from_observations,
     )
-    from .step4_decomposition import (
-        VaryingDynamicsDecomposition,
-        VaryingStructureDecomposition,
-        decompose_vector_field,
+    from .step4_source_decomposition import (
+        SourceDecompositionResult,
+        decompose_shared_interaction_law,
+        decompose_vector_field_sources,
+        decompose_sources,
     )
-except ImportError:  # flat directory imports
-    from step1_change_detection import ChangeDetectionResult, detect_changes
-    from step2_change_structure import ChangeStructureResult, infer_change_structure
+
+except ImportError:  # flat-directory imports
+    from step1_change_detection import (
+        ChangeDetectionResult,
+        detect_changes,
+    )
+    from step2_change_structure import (
+        ChangeStructureResult,
+        infer_change_structure,
+        infer_change_structure_from_observations,
+    )
     from step3_vector_field import (
-        LibraryFunction,
         VectorFieldReconstructionResult,
         reconstruct_vector_field,
+        reconstruct_vector_field_from_observations,
     )
-    from step4_decomposition import (
-        VaryingDynamicsDecomposition,
-        VaryingStructureDecomposition,
-        decompose_vector_field,
+    from step4_source_decomposition import (
+        SourceDecompositionResult,
+        decompose_shared_interaction_law,
+        decompose_vector_field_sources,
+        decompose_sources,
     )
 
 
 IntArray = NDArray[np.int64]
-Hypothesis = Literal["varying_structure", "varying_dynamics"]
-DecompositionResult = VaryingStructureDecomposition | VaryingDynamicsDecomposition
+FloatArray = NDArray[np.float64]
+
+ChangeHypothesis = Literal[
+    "varying_structure",
+    "varying_dynamics",
+]
+
+SourceHypothesis = Literal[
+    "shared_interaction_law",
+]
+
+
+# -----------------------------------------------------------------------------
+# Pipeline result
+# -----------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class TIDESResult:
-    """Complete output of :func:`run_tides`.
+    """Output of the current preprocessed-observation TIDES pipeline.
 
-    ``step1`` or ``step2`` is ``None`` when that stage was bypassed by a manual
-    / oracle input.  ``transition_indices`` and ``change_constraints`` always
-    record what was actually supplied to Step 3.
+    ``step1`` is optional provenance: Step 1 is normally run before the
+    preprocessing that constructs ``Y`` and ``edge_features``.
+
+    ``step2`` is ``None`` only when manual/oracle change constraints were
+    supplied.  Steps 3 and 4 never use Step-2 diagnostic coefficients; Step 3
+    refits the full unprojected selected-support model.
     """
 
-    hypothesis: str
-    transition_indices: IntArray
+    change_hypothesis: str
+    source_hypothesis: Optional[str]
+
+    transition_indices: Optional[IntArray]
+    transition_times: Optional[FloatArray]
     change_constraints: Any
+
     step1: Optional[ChangeDetectionResult]
     step2: Optional[ChangeStructureResult]
     step3: VectorFieldReconstructionResult
-    step4: Optional[DecompositionResult]
+    step4: Optional[SourceDecompositionResult]
 
     @property
     def B_stages(self):
-        """Convenience alias for the reconstructed stage-wise B matrices."""
-
+        """Stage-wise reconstructed edge-space vector fields."""
         return self.step3.B_stages
 
     @property
@@ -100,153 +158,393 @@ class TIDESResult:
         return self.step3.delta_B
 
     @property
-    def decomposition(self):
+    def source_decomposition(self):
+        """Step-4 source-decomposition result."""
         return self.step4
 
+    @property
+    def decomposition(self):
+        """Backward-compatible alias for ``source_decomposition``."""
+        return self.step4
+
+    @property
+    def theta(self):
+        """Shared interaction-law coefficients when Step 4 was run."""
+        return None if self.step4 is None else self.step4.theta
+
+    @property
+    def W_stages(self):
+        """Microscopic edge amplitudes when Step 4 was run."""
+        return None if self.step4 is None else self.step4.W_stages
+
+
+# -----------------------------------------------------------------------------
+# Small orchestration helpers
+# -----------------------------------------------------------------------------
 
 
 def _as_kwargs(values: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     return {} if values is None else dict(values)
 
 
+def _coerce_optional_int_vector(
+    values: Optional[Sequence[int]],
+    *,
+    name: str,
+) -> Optional[IntArray]:
+
+    if values is None:
+        return None
+
+    out = np.asarray(values, dtype=np.int64).reshape(-1)
+
+    if out.size and not np.all(np.diff(out) > 0):
+        raise ValueError(f"{name} must be strictly increasing.")
+
+    return out
+
+
+def _coerce_optional_float_vector(
+    values: Optional[Sequence[float]],
+    *,
+    name: str,
+) -> Optional[FloatArray]:
+
+    if values is None:
+        return None
+
+    out = np.asarray(values, dtype=float).reshape(-1)
+
+    if not np.all(np.isfinite(out)):
+        raise ValueError(f"{name} must contain only finite values.")
+
+    if out.size and not np.all(np.diff(out) > 0):
+        raise ValueError(f"{name} must be strictly increasing.")
+
+    return out
+
+
+def _transition_metadata_from_constraints(
+    constraints,
+) -> tuple[Optional[IntArray], Optional[FloatArray]]:
+    """Best-effort extraction for manual Step-2 constraints."""
+
+    if constraints is None:
+        return None, None
+
+    if hasattr(constraints, "constraints"):
+        constraints = constraints.constraints
+
+    try:
+        items = tuple(constraints)
+    except TypeError:
+        return None, None
+
+    if not items:
+        return (
+            np.zeros(0, dtype=np.int64),
+            np.zeros(0, dtype=float),
+        )
+
+    if not all(hasattr(c, "transition_index") for c in items):
+        return None, None
+
+    indices = np.asarray(
+        [int(c.transition_index) for c in items],
+        dtype=np.int64,
+    )
+
+    if all(hasattr(c, "transition_time") for c in items):
+        times = np.asarray(
+            [float(c.transition_time) for c in items],
+            dtype=float,
+        )
+        if not np.all(np.isfinite(times)):
+            times = None
+    else:
+        times = None
+
+    return indices, times
+
+
+# -----------------------------------------------------------------------------
+# Current formal orchestration: preprocessed observations -> Steps 2--4
+# -----------------------------------------------------------------------------
+
 
 def run_tides(
-    X: ArrayLike,
-    t: ArrayLike,
+    Y: ArrayLike,
     D: ArrayLike,
-    library: Sequence[LibraryFunction],
+    edge_features: ArrayLike,
+    stage_of_sample: Sequence[int],
     *,
-    hypothesis: Hypothesis,
+    change_hypothesis: ChangeHypothesis = "varying_structure",
+    source_hypothesis: SourceHypothesis = "shared_interaction_law",
+    profile_floor: Optional[float] = None,
     transition_indices: Optional[Sequence[int]] = None,
+    transition_times: Optional[Sequence[float]] = None,
+    edge_labels: Optional[Sequence[Any]] = None,
     change_constraints: Any = None,
-    run_decomposition: bool = True,
-    step1_kwargs: Optional[Mapping[str, Any]] = None,
+    step1_result: Optional[ChangeDetectionResult] = None,
+    run_source_decomposition: bool = True,
     step2_kwargs: Optional[Mapping[str, Any]] = None,
     step3_kwargs: Optional[Mapping[str, Any]] = None,
     step4_kwargs: Optional[Mapping[str, Any]] = None,
 ) -> TIDESResult:
-    """Run the current four-step TIDES pipeline.
+    """
+    Run the current TIDES pipeline from preprocessed observations.
 
     Parameters
     ----------
-    X, t
-        Observed trajectory. ``X`` has shape ``(n_samples, n_nodes)``.
-    D
-        Candidate-edge incidence/aggregation matrix with shape
-        ``(n_nodes, n_candidate_edges)`` for the current conservative pairwise
-        representation.
-    library
-        Candidate interaction-function library used by Step 3.
-    hypothesis
-        Physical branch used by hypothesis-dependent Steps 2 and 4.
-        Currently ``"varying_structure"`` is the implemented end-to-end branch.
+    Y
+        Preprocessed node-space vector-field observations, shape ``(T,N)``.
 
-    transition_indices
-        Optional manual/oracle Step-1 output.  If supplied, Step 1 is skipped.
-        Indices refer to sample boundaries in the same convention as
-        :func:`detect_changes`.
+    D
+        Candidate-edge incidence / aggregation matrix, shape ``(N,M)``.
+
+    edge_features
+        Edge-space feature responses, shape ``(T,M,L)``.
+
+    stage_of_sample
+        Detected stage label of each preprocessed observation.
+
+    change_hypothesis
+        Step-2 structural hypothesis.  The current implemented branch is
+        ``'varying_structure'``.
+
+    source_hypothesis
+        Step-4 microscopic source hypothesis.  The current implemented branch
+        is ``'shared_interaction_law'``.
+
+    profile_floor
+        Data-derived numerical-resolution floor used by the current formal
+        forward/backward Step-2 sparse search.
+
+    transition_indices, transition_times
+        Optional Step-1 metadata.  They label Step-2 constraints but are not
+        used to fit coefficients.
+
+    edge_labels
+        Optional human-readable labels for candidate edges.
 
     change_constraints
-        Optional manual/oracle Step-2 output.  It may be either the Step-2
-        constraint objects or a sequence of raw row-support index arrays, both
-        of which are accepted by Step 3.  If supplied, Step 2 is skipped.
+        Optional manual/oracle Step-2 output.  If supplied, Step 2 is skipped
+        and the constraints are passed directly to Step 3.
 
-    run_decomposition
-        If ``False``, stop after Step 3.  This is useful for vector-field-only
-        regression tests.
+    step1_result
+        Optional Step-1 result retained for provenance.  If transition metadata
+        are not supplied explicitly, they are copied from this object.
+
+    run_source_decomposition
+        If False, stop after Step 3.
 
     stepN_kwargs
-        Keyword dictionaries forwarded only to the corresponding independent
-        step.  Core pipeline arguments are supplied by this function and should
-        not be repeated in these dictionaries.
-
-    Returns
-    -------
-    TIDESResult
-        All intermediate results plus the inputs actually passed between steps.
+        Additional keyword arguments forwarded only to that step.
 
     Notes
     -----
-    This wrapper deliberately does not infer the physical hypothesis from data.
-    The hypothesis must be supplied explicitly because it changes the Step-2
-    change model and the Step-4 source decomposition.
+    For ``varying_structure``, this wrapper defaults Step 2 to the currently
+    validated ``forward_backward_floor`` sparse search.  It does not use the
+    old Adaptive Group LASSO path unless explicitly requested in
+    ``step2_kwargs``.
     """
 
-    s1_kwargs = _as_kwargs(step1_kwargs)
     s2_kwargs = _as_kwargs(step2_kwargs)
     s3_kwargs = _as_kwargs(step3_kwargs)
     s4_kwargs = _as_kwargs(step4_kwargs)
 
-    # ------------------------------------------------------------------ Step 1
-    if transition_indices is None:
-        step1 = detect_changes(X, t, **s1_kwargs)
-        transitions = np.asarray(step1.transition_indices, dtype=np.int64)
-    else:
-        step1 = None
-        transitions = np.asarray(transition_indices, dtype=np.int64)
-        if transitions.ndim != 1:
-            raise ValueError("transition_indices must be one-dimensional.")
-        if transitions.size and not np.all(np.diff(transitions) > 0):
-            raise ValueError("transition_indices must be strictly increasing.")
+    # Step-1 metadata are provenance / labeling information only.
+    if step1_result is not None:
+        if transition_indices is None:
+            transition_indices = step1_result.transition_indices
+        if transition_times is None:
+            transition_times = step1_result.transition_times
+
+    transitions = _coerce_optional_int_vector(
+        transition_indices,
+        name="transition_indices",
+    )
+    transition_t = _coerce_optional_float_vector(
+        transition_times,
+        name="transition_times",
+    )
+
+    if (
+        transitions is not None
+        and transition_t is not None
+        and transitions.size != transition_t.size
+    ):
+        raise ValueError(
+            "transition_indices and transition_times must have equal length."
+        )
 
     # ------------------------------------------------------------------ Step 2
     if change_constraints is None:
-        step2 = infer_change_structure(
-            X,
-            t,
+
+        forbidden_step2 = {
+            "hypothesis",
+            "transition_indices",
+            "transition_times",
+            "edge_labels",
+            "profile_floor",
+        } & set(s2_kwargs)
+
+        if forbidden_step2:
+            raise ValueError(
+                "These Step-2 arguments are supplied by run_tides and must "
+                "not be repeated in step2_kwargs: "
+                + ", ".join(sorted(forbidden_step2))
+            )
+
+        if change_hypothesis == "varying_structure":
+            s2_kwargs.setdefault(
+                "solver_method",
+                "forward_backward_floor",
+            )
+
+            if (
+                s2_kwargs["solver_method"] == "forward_backward_floor"
+                and profile_floor is None
+            ):
+                raise ValueError(
+                    "The formal varying_structure Step-2 solver "
+                    "'forward_backward_floor' requires profile_floor."
+                )
+
+        step2 = infer_change_structure_from_observations(
+            Y,
             D,
-            transitions,
-            hypothesis=hypothesis,
+            edge_features,
+            stage_of_sample,
+            hypothesis=change_hypothesis,
+            transition_indices=transitions,
+            transition_times=transition_t,
+            edge_labels=edge_labels,
+            profile_floor=profile_floor,
             **s2_kwargs,
         )
-        constraints_for_step3: Any = step2.constraints
+
+        constraints_for_step3: Any = step2
+
+        if transitions is None:
+            transitions = np.asarray(
+                [c.transition_index for c in step2.constraints],
+                dtype=np.int64,
+            )
+        if transition_t is None:
+            times = np.asarray(
+                [c.transition_time for c in step2.constraints],
+                dtype=float,
+            )
+            if np.all(np.isfinite(times)):
+                transition_t = times
+
     else:
         step2 = None
         constraints_for_step3 = change_constraints
 
+        if transitions is None or transition_t is None:
+            inferred_idx, inferred_t = _transition_metadata_from_constraints(
+                change_constraints
+            )
+            if transitions is None:
+                transitions = inferred_idx
+            if transition_t is None:
+                transition_t = inferred_t
+
     # ------------------------------------------------------------------ Step 3
-    step3 = reconstruct_vector_field(
-        X,
-        t,
+    forbidden_step3 = {
+        "Y",
+        "D",
+        "edge_features",
+        "stage_of_sample",
+        "change_constraints_or_supports",
+    } & set(s3_kwargs)
+
+    if forbidden_step3:
+        raise ValueError(
+            "These Step-3 arguments are supplied by run_tides and must not "
+            "be repeated in step3_kwargs: "
+            + ", ".join(sorted(forbidden_step3))
+        )
+
+    step3 = reconstruct_vector_field_from_observations(
+        Y,
         D,
-        library,
-        transitions,
+        edge_features,
+        stage_of_sample,
         constraints_for_step3,
         **s3_kwargs,
     )
 
     # ------------------------------------------------------------------ Step 4
-    if run_decomposition:
-        step4 = decompose_vector_field(
-            step3.B_stages,
-            hypothesis=hypothesis,
+    if run_source_decomposition:
+
+        forbidden_step4 = {"hypothesis"} & set(s4_kwargs)
+        if forbidden_step4:
+            raise ValueError(
+                "Pass source_hypothesis through run_tides, not step4_kwargs."
+            )
+
+        step4 = decompose_vector_field_sources(
+            step3,
+            hypothesis=source_hypothesis,
             **s4_kwargs,
         )
+        source_name: Optional[str] = str(source_hypothesis)
+
     else:
         step4 = None
+        source_name = None
 
     return TIDESResult(
-        hypothesis=hypothesis,
-        transition_indices=transitions,
+        change_hypothesis=str(change_hypothesis),
+        source_hypothesis=source_name,
+        transition_indices=(
+            None if transitions is None else transitions.copy()
+        ),
+        transition_times=(
+            None if transition_t is None else transition_t.copy()
+        ),
         change_constraints=constraints_for_step3,
-        step1=step1,
+        step1=step1_result,
         step2=step2,
         step3=step3,
         step4=step4,
     )
 
 
-# Short alias for interactive notebooks.
+# Explicit name that documents where the current wrapper starts.
+run_tides_from_observations = run_tides
+
+# Short interactive alias.
 run = run_tides
 
 
 __all__ = [
+    # Pipeline result / orchestration.
     "TIDESResult",
     "run_tides",
+    "run_tides_from_observations",
     "run",
-    # Re-export the four independent public steps so a single import is enough.
+
+    # Step 1.
+    "ChangeDetectionResult",
     "detect_changes",
+
+    # Step 2.
+    "ChangeStructureResult",
     "infer_change_structure",
+    "infer_change_structure_from_observations",
+
+    # Step 3.
+    "VectorFieldReconstructionResult",
     "reconstruct_vector_field",
-    "decompose_vector_field",
+    "reconstruct_vector_field_from_observations",
+
+    # Step 4: source decomposition.
+    "SourceDecompositionResult",
+    "decompose_shared_interaction_law",
+    "decompose_vector_field_sources",
+    "decompose_sources",
 ]

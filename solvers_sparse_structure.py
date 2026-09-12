@@ -1,28 +1,46 @@
 """
-Generic numerical solvers for TIDES.
+Generic grouped sparse solvers for TIDES.
 
 This module intentionally contains no TIDES-specific modelling logic.
-Problem-specific modules (e.g. step2_change_structure.py) are responsible
-for constructing X, y, and the group partition before calling these solvers.
+Problem-specific modules (for example ``step2_change_structure.py``) build the
+linear inverse problem ``y ~= X @ beta`` and define the non-overlapping group
+partition before calling these numerical routines.
 
-The first solver implemented here is a scalar-response Adaptive Group LASSO
-with:
-    - RMS column standardisation
-    - condition-number-adaptive Ridge pilot
-    - adaptive group weights
-    - KKT-certified working-set hybrid proximal/Newton solves
-    - KKT-event-driven lambda continuation
-    - unpenalised post-selection least-squares refit
+Primary solver
+--------------
+``solve_group_basis_pursuit_denoising`` solves the noise-aware convex problem
 
-Its numerical core is adapted from the mature TSC v3.6 AGLASSO machinery,
-but TSC-specific extrapolation, F0/F1 construction, validation, pruning,
-checkpointing, and structural-library logic are deliberately excluded.
+    minimise    sum_g w_g ||beta_g||_2
+    subject to  ||y - X beta||_2 <= delta,
+
+where ``delta`` is an externally calibrated uncertainty radius.  The solver
+returns a continuous grouped solution and a ranking of group norms; it does
+*not* choose a support.  Support certification belongs to the problem-specific
+Step-2 layer, which can refit ranked prefixes and stop at the first prefix that
+reaches the independently supplied uncertainty floor.
+
+For the current correctness benchmark the reference implementation uses
+Douglas--Rachford splitting.  Projection onto the residual ball is evaluated
+accurately from one thin SVD of the dense design.
+
+A second large-scale ranking backend,
+``solve_screened_group_basis_pursuit_denoising``, never requires the global
+design matrix.  It accesses one group block at a time, builds a floor-feasible
+working set by exact conditional least-squares screening, and runs the same
+Douglas--Rachford BPDN solver only on that restricted matrix.  Problem-specific
+operator layers may provide a batched conditional-gain callback so the global
+scan can also be evaluated without materialising all candidate blocks.
+
+Legacy baselines
+----------------
+The previous Adaptive Group LASSO and forward/backward floor search are retained
+as diagnostic/baseline solvers so existing notebooks remain import-compatible.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Hashable, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Hashable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -104,6 +122,92 @@ class ForwardBackwardGroupSearchResult:
     all_path_kkt_certified: bool = False
     total_kkt_reactivations: int = 0
     selection_method: str = "forward-backward-floor-search"
+
+
+@dataclass(frozen=True)
+class GroupBasisPursuitResult:
+    """Continuous solution of grouped basis-pursuit denoising.
+
+    ``coefficients`` are returned in the coordinates supplied by the caller.
+    ``group_scores[label]`` is ``||coefficients[group]||_2`` unless explicit
+    group weights are supplied; the ranking always uses these unweighted group
+    norms.  The convex objective value itself uses ``group_weights``.
+
+    The solver deliberately does not report a selected support.  A caller that
+    needs model selection should use ``ranking`` and certify prefixes against
+    the same residual radius with an unpenalised refit.
+    """
+
+    coefficients: Array
+    group_scores: Dict[GroupLabel, float]
+    ranking: Tuple[GroupLabel, ...]
+    objective_value: float
+    residual_norm: float
+    relative_residual: float
+    residual_radius: float
+    target_relative_residual: float
+    feasible: bool
+    converged: bool
+    stop_reason: str
+    iterations: int
+    fixed_point_residual: float
+    douglas_rachford_step: float
+    group_weights: Dict[GroupLabel, float]
+    design_rank: int
+    design_singular_values: Array
+    irreducible_residual_norm: float
+    projection_backend: str = "dense-svd"
+    selection_method: str = "group-bpdn-ranking"
+
+
+@dataclass(frozen=True)
+class ScreenedGroupBasisPursuitResult:
+    """Continuous grouped BPDN ranking from a memory-scalable screened solve.
+
+    The global design matrix is never required.  A caller supplies one group
+    block at a time through ``group_block_provider``.  A deterministic forward
+    feasibility screen first constructs a small working set whose unpenalised
+    refit reaches the requested residual ball.  The *same* dense-SVD
+    Douglas--Rachford BPDN reference solver is then applied only to that
+    restricted working set.
+
+    This object deliberately reports a ranking rather than a selected support.
+    Final support-size choice remains the responsibility of the caller (for
+    TIDES, the independently calibrated prefix-floor certification in Step 2).
+
+    Important
+    ---------
+    Screening is an acceleration device, not a proof that omitted groups have
+    zero coefficients in the full convex optimum.  ``coefficients`` and
+    ``group_scores`` therefore contain zeros outside ``screening_groups``.
+    The intended regression criterion is equality of the *certified Step-2
+    support* with the dense reference backend, not coefficient-by-coefficient
+    equality of tiny leakage directions.
+    """
+
+    coefficients: Array
+    group_scores: Dict[GroupLabel, float]
+    ranking: Tuple[GroupLabel, ...]
+    objective_value: float
+    residual_norm: float
+    relative_residual: float
+    residual_radius: float
+    target_relative_residual: float
+    feasible: bool
+    converged: bool
+    stop_reason: str
+    group_weights: Dict[GroupLabel, float]
+    screening_groups: Tuple[GroupLabel, ...]
+    screening_relative_residual: float
+    screening_steps: int
+    screening_rank: int
+    screening_condition_number: float
+    restricted_result: GroupBasisPursuitResult
+    n_global_groups: int
+    n_restricted_groups: int
+    peak_restricted_columns: int
+    projection_backend: str = "screened-dense-svd"
+    selection_method: str = "screened-group-bpdn-ranking"
 
 
 # -----------------------------------------------------------------------------
@@ -962,6 +1066,992 @@ def _adaptive_next_lambda(
 
 
 # -----------------------------------------------------------------------------
+# Noise-aware grouped basis-pursuit denoising
+# -----------------------------------------------------------------------------
+
+
+def _validate_group_weights(
+    group_order: Tuple[GroupLabel, ...],
+    group_weights: Optional[Mapping[GroupLabel, float]],
+) -> Dict[GroupLabel, float]:
+    """Return a complete positive finite group-weight dictionary."""
+
+    if group_weights is None:
+        return {label: 1.0 for label in group_order}
+
+    supplied = set(group_weights.keys())
+    expected = set(group_order)
+    missing = expected - supplied
+    extra = supplied - expected
+    if missing or extra:
+        raise ValueError(
+            "group_weights must contain exactly the same labels as groups; "
+            f"missing={list(missing)[:10]!r}, extra={list(extra)[:10]!r}."
+        )
+
+    clean: Dict[GroupLabel, float] = {}
+    for label in group_order:
+        value = float(group_weights[label])
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f"group weight for {label!r} must be positive and finite."
+            )
+        clean[label] = value
+    return clean
+
+
+def _group_soft_threshold(
+    vector: Array,
+    threshold: float,
+    groups: Mapping[GroupLabel, Array],
+    group_order: Tuple[GroupLabel, ...],
+    weights: Mapping[GroupLabel, float],
+) -> Array:
+    """Proximal map of ``threshold * sum_g w_g ||beta_g||_2``."""
+
+    out = np.asarray(vector, dtype=float).copy()
+    for label in group_order:
+        idx = groups[label]
+        norm = float(np.linalg.norm(out[idx]))
+        cutoff = float(threshold * weights[label])
+        if norm <= cutoff:
+            out[idx] = 0.0
+        else:
+            out[idx] *= 1.0 - cutoff / norm
+    return out
+
+
+class _DenseResidualBallProjector:
+    """Euclidean projector onto ``{beta: ||X beta - y||_2 <= delta}``.
+
+    One thin SVD is cached.  Each subsequent projection is reduced to a scalar
+    monotone root solve for the KKT multiplier.  No TIDES-specific assumptions
+    enter here.
+    """
+
+    def __init__(
+        self,
+        X: Array,
+        y: Array,
+        radius: float,
+        *,
+        lambda_bisection_iterations: int = 70,
+    ) -> None:
+        self.X = np.asarray(X, dtype=float)
+        self.y = np.asarray(y, dtype=float).reshape(-1)
+        self.radius = float(radius)
+        self.lambda_bisection_iterations = int(lambda_bisection_iterations)
+
+        if self.radius < 0.0 or not np.isfinite(self.radius):
+            raise ValueError("residual radius must be non-negative and finite.")
+        if self.lambda_bisection_iterations < 20:
+            raise ValueError("lambda_bisection_iterations must be >= 20.")
+
+        U_full, singular_full, Vt_full = np.linalg.svd(
+            self.X,
+            full_matrices=False,
+        )
+        self.singular_values_full = singular_full.copy()
+
+        if singular_full.size == 0 or singular_full[0] <= 0.0:
+            rank_tol = np.inf
+            keep = np.zeros_like(singular_full, dtype=bool)
+        else:
+            rank_tol = float(
+                np.finfo(float).eps
+                * max(self.X.shape)
+                * singular_full[0]
+            )
+            keep = singular_full > rank_tol
+
+        self.design_rank = int(np.sum(keep))
+        self.rank_tolerance = float(rank_tol)
+        self.U = U_full[:, keep]
+        self.singular = singular_full[keep]
+        self.Vt = Vt_full[keep, :]
+        self.singular_squared = self.singular * self.singular
+        self.Uty = self.U.T @ self.y
+
+        # Directions below the standard numerical-rank threshold are treated as
+        # unresolved rather than exploited through enormous coefficients.  Their
+        # target component therefore belongs to the irreducible residual.
+        y_perp = self.y - self.U @ self.Uty
+        self.irreducible_residual_norm = float(np.linalg.norm(y_perp))
+        self.irreducible_residual_squared = float(y_perp @ y_perp)
+
+        # Numerical feasibility of the residual ball.  The small tolerance only
+        # protects against round-off in the orthogonal projection of y.
+        feasibility_slack = 100.0 * np.finfo(float).eps * max(
+            float(np.linalg.norm(self.y)),
+            self.radius,
+            1.0,
+        )
+        if self.irreducible_residual_norm > self.radius + feasibility_slack:
+            raise ValueError(
+                "The requested residual ball does not intersect the design "
+                "column space: irreducible residual "
+                f"{self.irreducible_residual_norm:.3e} exceeds radius "
+                f"{self.radius:.3e}."
+            )
+
+    def project(self, beta: Array) -> Array:
+        beta = np.asarray(beta, dtype=float).reshape(-1)
+        coordinates = self.Vt @ beta
+        active_residual = self.singular * coordinates - self.Uty
+        residual_squared = float(
+            active_residual @ active_residual
+            + self.irreducible_residual_squared
+        )
+
+        if residual_squared <= self.radius * self.radius:
+            return beta.copy()
+
+        target_active_squared = max(
+            self.radius * self.radius - self.irreducible_residual_squared,
+            0.0,
+        )
+        if target_active_squared <= 0.0:
+            # Exact projection onto the closest point in the column space.  The
+            # formal infinite-multiplier limit is numerically represented by
+            # removing all residual components associated with nonzero singular
+            # values.  This branch is uncommon for TIDES because the supplied
+            # uncertainty radius is positive.
+            nonzero = self.singular > 0.0
+            correction = np.zeros_like(active_residual)
+            correction[nonzero] = (
+                active_residual[nonzero] / self.singular[nonzero]
+            )
+            return beta - self.Vt.T @ correction
+
+        def secular(lam: float) -> float:
+            denominator = 1.0 + lam * self.singular_squared
+            shrunk = active_residual / denominator
+            return float(shrunk @ shrunk - target_active_squared)
+
+        lo = 0.0
+        hi = 1.0
+        value_hi = secular(hi)
+        # The secular function is monotone decreasing.  Geometric bracketing is
+        # stable even when the requested radius is extremely small.
+        for _ in range(320):
+            if value_hi <= 0.0:
+                break
+            hi *= 10.0
+            if not np.isfinite(hi):
+                raise RuntimeError(
+                    "Residual-ball projection failed to bracket the KKT "
+                    "multiplier."
+                )
+            value_hi = secular(hi)
+        else:
+            raise RuntimeError(
+                "Residual-ball projection exceeded multiplier bracketing limit."
+            )
+
+        for _ in range(self.lambda_bisection_iterations):
+            if lo <= 0.0:
+                mid = 0.5 * hi
+            else:
+                # Geometric bisection resolves many decades of multipliers much
+                # more evenly than arithmetic bisection.
+                mid = float(np.sqrt(lo * hi))
+            if secular(mid) > 0.0:
+                lo = mid
+            else:
+                hi = mid
+
+        lam = hi
+        denominator = 1.0 + lam * self.singular_squared
+        correction_svd = (
+            lam
+            * self.singular
+            / denominator
+            * active_residual
+        )
+        return beta - self.Vt.T @ correction_svd
+
+
+def _default_douglas_rachford_step(
+    y: Array,
+    largest_singular_value: float,
+) -> float:
+    """Scale-aware numerical step for Douglas--Rachford splitting.
+
+    The parameter changes convergence speed but not the convex minimiser.  The
+    scale ``||y|| / ||X||_2`` has coefficient units; multiplying it by 1e-3 has
+    been conservative on the current high-accuracy benchmark and remains
+    invariant under a common rescaling of the linear inverse problem.
+    """
+
+    coefficient_scale = float(np.linalg.norm(y)) / max(
+        float(largest_singular_value),
+        np.finfo(float).tiny,
+    )
+    return max(1.0e-3 * coefficient_scale, np.finfo(float).eps)
+
+
+def solve_group_basis_pursuit_denoising(
+    X: Array,
+    y: Array,
+    groups: Mapping[GroupLabel, Sequence[int]],
+    *,
+    residual_radius: Optional[float] = None,
+    target_relative_residual: Optional[float] = None,
+    group_weights: Optional[Mapping[GroupLabel, float]] = None,
+    max_iter: int = 10000,
+    tol: float = 1e-8,
+    check_every: int = 50,
+    douglas_rachford_step: Optional[float] = None,
+    lambda_bisection_iterations: int = 70,
+    verbose: bool = True,
+) -> GroupBasisPursuitResult:
+    """Solve noise-aware grouped basis-pursuit denoising.
+
+    The optimisation problem is
+
+    ``min_beta sum_g w_g ||beta_g||_2``
+
+    subject to
+
+    ``||y - X @ beta||_2 <= residual_radius``.
+
+    Exactly one of ``residual_radius`` and ``target_relative_residual`` must be
+    supplied.  The latter is converted to an absolute radius using ``||y||_2``.
+
+    Notes
+    -----
+    * The returned continuous solution is *not* thresholded.
+    * ``ranking`` orders groups by unweighted coefficient norm.  The caller may
+      use that ordering for support certification, but support size selection is
+      deliberately outside this generic solver.
+    * ``group_weights`` are optional positive convex-penalty weights.  The
+      default is the theoretically simplest unweighted group ``l2,1`` norm.
+    * The current backend is dense-SVD Douglas--Rachford.  It is intended as the
+      correctness/reference implementation before a future matrix-free backend.
+    """
+
+    X_raw, y, groups_clean, group_order = _validate_problem(X, y, groups)
+    weights = _validate_group_weights(group_order, group_weights)
+
+    if (residual_radius is None) == (target_relative_residual is None):
+        raise ValueError(
+            "Supply exactly one of residual_radius or target_relative_residual."
+        )
+
+    y_norm = float(np.linalg.norm(y))
+    if target_relative_residual is not None:
+        relative_target = float(target_relative_residual)
+        if not np.isfinite(relative_target) or relative_target < 0.0:
+            raise ValueError("target_relative_residual must be finite and >= 0.")
+        if y_norm <= np.finfo(float).tiny:
+            raise ValueError(
+                "target_relative_residual is undefined for a zero target; "
+                "supply residual_radius instead."
+            )
+        radius = relative_target * y_norm
+    else:
+        radius = float(residual_radius)
+        if not np.isfinite(radius) or radius < 0.0:
+            raise ValueError("residual_radius must be finite and >= 0.")
+        relative_target = (
+            radius / y_norm if y_norm > np.finfo(float).tiny else np.nan
+        )
+
+    if max_iter < 1:
+        raise ValueError("max_iter must be >= 1.")
+    if tol <= 0.0 or not np.isfinite(tol):
+        raise ValueError("tol must be positive and finite.")
+    if check_every < 1:
+        raise ValueError("check_every must be >= 1.")
+
+    projector = _DenseResidualBallProjector(
+        X_raw,
+        y,
+        radius,
+        lambda_bisection_iterations=lambda_bisection_iterations,
+    )
+
+    if projector.design_rank == 0:
+        raise ValueError("The design has numerical rank zero.")
+    largest_singular = float(projector.singular[0])
+    if douglas_rachford_step is None:
+        dr_step = _default_douglas_rachford_step(y, largest_singular)
+    else:
+        dr_step = float(douglas_rachford_step)
+        if not np.isfinite(dr_step) or dr_step <= 0.0:
+            raise ValueError("douglas_rachford_step must be positive and finite.")
+
+    if verbose:
+        print("Starting grouped basis-pursuit denoising...")
+        print(
+            f"  samples={X_raw.shape[0]} | coefficients={X_raw.shape[1]} | "
+            f"groups={len(group_order)}"
+        )
+        print(
+            f"  residual radius={radius:.3e} | "
+            f"relative target={relative_target:.3e}"
+        )
+        print(
+            f"  backend=dense-svd Douglas-Rachford | rank="
+            f"{projector.design_rank}/{min(X_raw.shape)} | "
+            f"DR step={dr_step:.3e}"
+        )
+        print(
+            "  support selection=disabled here; solver returns group ranking only"
+        )
+
+    # Douglas--Rachford iterate.  The shadow sequence ``primal`` is always in
+    # the residual ball because it is an exact projection onto the constraint.
+    state = np.zeros(X_raw.shape[1], dtype=float)
+    primal = projector.project(state)
+    fixed_point_residual = np.inf
+    iterations = 0
+    converged = False
+    stop_reason = f"maximum iterations reached ({max_iter})"
+
+    for iteration in range(1, max_iter + 1):
+        primal = projector.project(state)
+        reflected = 2.0 * primal - state
+        proximal = _group_soft_threshold(
+            reflected,
+            dr_step,
+            groups_clean,
+            group_order,
+            weights,
+        )
+        displacement = proximal - primal
+        state = state + displacement
+        iterations = iteration
+
+        if iteration == 1 or iteration % check_every == 0:
+            fixed_point_residual = float(
+                np.linalg.norm(displacement)
+                / max(1.0, float(np.linalg.norm(primal)))
+            )
+            if verbose and (
+                iteration == 1
+                or iteration % max(check_every, 10 * check_every) == 0
+            ):
+                prediction = X_raw @ primal
+                rel = _relative_residual(prediction, y)
+                print(
+                    f"  [iter {iteration:6d}] fixed-point="
+                    f"{fixed_point_residual:.3e} | rel-res={rel:.3e}"
+                )
+
+            if fixed_point_residual <= tol:
+                converged = True
+                stop_reason = "Douglas-Rachford fixed-point tolerance reached"
+                break
+
+    # Recompute the final shadow point after the last state update so all
+    # reported quantities correspond to the returned coefficient vector.
+    coefficients = projector.project(state)
+    prediction = X_raw @ coefficients
+    residual_norm = float(np.linalg.norm(prediction - y))
+    relative_residual = (
+        residual_norm / y_norm if y_norm > np.finfo(float).tiny else np.nan
+    )
+    feasibility_tol = max(
+        100.0 * np.finfo(float).eps * max(y_norm, radius, 1.0),
+        1.0e-12 * max(radius, 1.0),
+    )
+    feasible = bool(residual_norm <= radius + feasibility_tol)
+
+    scores = {
+        label: float(np.linalg.norm(coefficients[groups_clean[label]]))
+        for label in group_order
+    }
+    order_index = {label: i for i, label in enumerate(group_order)}
+    ranking = tuple(
+        sorted(
+            group_order,
+            key=lambda label: (-scores[label], order_index[label]),
+        )
+    )
+    objective_value = float(
+        sum(weights[label] * scores[label] for label in group_order)
+    )
+
+    if not feasible:
+        converged = False
+        stop_reason = "returned shadow iterate violates residual radius"
+
+    if verbose:
+        print("Grouped basis-pursuit denoising complete.")
+        print(f"  stop reason={stop_reason}")
+        print(
+            f"  iterations={iterations} | fixed-point="
+            f"{fixed_point_residual:.3e} | feasible={feasible}"
+        )
+        print(
+            f"  relative residual={relative_residual:.3e} | "
+            f"objective={objective_value:.6e}"
+        )
+
+    return GroupBasisPursuitResult(
+        coefficients=coefficients.copy(),
+        group_scores=dict(scores),
+        ranking=tuple(ranking),
+        objective_value=float(objective_value),
+        residual_norm=float(residual_norm),
+        relative_residual=float(relative_residual),
+        residual_radius=float(radius),
+        target_relative_residual=float(relative_target),
+        feasible=bool(feasible),
+        converged=bool(converged),
+        stop_reason=str(stop_reason),
+        iterations=int(iterations),
+        fixed_point_residual=float(fixed_point_residual),
+        douglas_rachford_step=float(dr_step),
+        group_weights=dict(weights),
+        design_rank=int(projector.design_rank),
+        design_singular_values=projector.singular_values_full.copy(),
+        irreducible_residual_norm=float(projector.irreducible_residual_norm),
+    )
+
+
+# Concise alias used by notebooks and future Step-2 orchestration.
+solve_group_bpdn = solve_group_basis_pursuit_denoising
+
+
+
+# -----------------------------------------------------------------------------
+# Memory-scalable screened BPDN
+# -----------------------------------------------------------------------------
+
+
+def _validate_block_problem(
+    y: Array,
+    groups: Mapping[GroupLabel, Sequence[int]],
+    *,
+    n_coefficients: int,
+) -> Tuple[Array, Dict[GroupLabel, Array], Tuple[GroupLabel, ...]]:
+    """Validate a grouped problem without requiring a global design matrix."""
+
+    y = np.asarray(y, dtype=float).reshape(-1)
+    if y.ndim != 1 or y.size == 0:
+        raise ValueError("y must be a non-empty one-dimensional array.")
+    if not np.all(np.isfinite(y)):
+        raise ValueError("y must be finite.")
+
+    p = int(n_coefficients)
+    if p < 1:
+        raise ValueError("n_coefficients must be positive.")
+    if not groups:
+        raise ValueError("groups must be non-empty.")
+
+    clean: Dict[GroupLabel, Array] = {}
+    seen = np.zeros(p, dtype=int)
+    for label, idx in groups.items():
+        arr = np.asarray(idx, dtype=int).reshape(-1)
+        if arr.size == 0:
+            raise ValueError(f"Group {label!r} is empty.")
+        if np.any(arr < 0) or np.any(arr >= p):
+            raise ValueError(
+                f"Group {label!r} contains out-of-range coefficient indices."
+            )
+        arr = np.unique(arr)
+        clean[label] = arr
+        seen[arr] += 1
+
+    if np.any(seen > 1):
+        overlap = np.flatnonzero(seen > 1)
+        raise ValueError(
+            "Screened grouped BPDN requires non-overlapping groups; "
+            f"overlap at coefficient indices {overlap[:20].tolist()}."
+        )
+    if np.any(seen == 0):
+        missing = np.flatnonzero(seen == 0)
+        raise ValueError(
+            "Every coefficient must belong to exactly one group; "
+            f"ungrouped indices {missing[:20].tolist()}."
+        )
+
+    return y, clean, tuple(clean.keys())
+
+
+def _coerce_group_block(
+    label: GroupLabel,
+    block: Array,
+    *,
+    n_rows: int,
+    expected_width: int,
+) -> Array:
+    """Validate one lazily materialised group block."""
+
+    G = np.asarray(block, dtype=float)
+    if G.ndim != 2:
+        raise ValueError(
+            f"group_block_provider({label!r}) must return a 2D array."
+        )
+    if G.shape != (n_rows, expected_width):
+        raise ValueError(
+            f"group_block_provider({label!r}) returned shape {G.shape}; "
+            f"expected {(n_rows, expected_width)}."
+        )
+    if not np.all(np.isfinite(G)):
+        raise ValueError(f"Group block {label!r} contains non-finite values.")
+    return G
+
+
+def _fit_materialised_group_blocks(
+    y: Array,
+    selected: Sequence[GroupLabel],
+    selected_blocks: Mapping[GroupLabel, Array],
+):
+    """Stable OLS refit and selected-span basis for lazily materialised groups."""
+
+    n = y.size
+    if not selected:
+        residual = y.copy()
+        return (
+            np.empty(0, dtype=float),
+            residual,
+            1.0,
+            0,
+            np.inf,
+            np.zeros((n, 0), dtype=float),
+            np.zeros((n, 0), dtype=float),
+        )
+
+    A = np.column_stack([selected_blocks[label] for label in selected])
+    scale = np.linalg.norm(A, axis=0)
+    scale = np.where(scale > 1e-14, scale, 1.0)
+    As = A / scale[None, :]
+
+    U, singular, Vt = np.linalg.svd(As, full_matrices=False)
+    if singular.size == 0 or singular[0] <= 0.0:
+        residual = y.copy()
+        return (
+            np.zeros(A.shape[1], dtype=float),
+            residual,
+            1.0,
+            0,
+            np.inf,
+            np.zeros((n, 0), dtype=float),
+            A,
+        )
+
+    rank_tol = float(np.finfo(float).eps * max(As.shape) * singular[0])
+    rank = int(np.sum(singular > rank_tol))
+    if rank == 0:
+        residual = y.copy()
+        return (
+            np.zeros(A.shape[1], dtype=float),
+            residual,
+            1.0,
+            0,
+            np.inf,
+            np.zeros((n, 0), dtype=float),
+            A,
+        )
+
+    Ur = U[:, :rank]
+    sr = singular[:rank]
+    Vr = Vt[:rank, :].T
+    coef_scaled = Vr @ ((Ur.T @ y) / sr)
+    coef = coef_scaled / scale
+    prediction = A @ coef
+    residual = y - prediction
+    rel = _relative_residual(prediction, y)
+    cond = (
+        float(singular[0] / singular[rank - 1])
+        if singular[rank - 1] > 0.0
+        else np.inf
+    )
+    return coef, residual, float(rel), int(rank), float(cond), Ur, A
+
+
+def _conditional_group_gain(
+    G: Array,
+    residual: Array,
+    Q: Array,
+) -> float:
+    """Exact conditional least-squares residual reduction for one group."""
+
+    if Q.shape[1]:
+        G_perp = G - Q @ (Q.T @ G)
+    else:
+        G_perp = G
+
+    coef, _, rank, _ = np.linalg.lstsq(G_perp, residual, rcond=None)
+    if rank == 0:
+        return 0.0
+    fitted = G_perp @ coef
+    return float(fitted @ fitted)
+
+
+def solve_screened_group_basis_pursuit_denoising(
+    y: Array,
+    groups: Mapping[GroupLabel, Sequence[int]],
+    *,
+    n_coefficients: int,
+    group_block_provider: Callable[[GroupLabel], Array],
+    residual_radius: Optional[float] = None,
+    target_relative_residual: Optional[float] = None,
+    group_weights: Optional[Mapping[GroupLabel, float]] = None,
+    initial_groups: Optional[Sequence[GroupLabel]] = None,
+    max_screening_groups: Optional[int] = None,
+    min_gain_ratio: float = 1e-14,
+    conditional_gain_provider: Optional[
+        Callable[[Array, Array, Tuple[GroupLabel, ...]], Tuple[GroupLabel, float]]
+    ] = None,
+    restricted_solver_kwargs: Optional[Mapping[str, object]] = None,
+    require_restricted_convergence: bool = True,
+    verbose: bool = True,
+) -> ScreenedGroupBasisPursuitResult:
+    """Solve grouped BPDN after a memory-scalable conditional feasibility screen.
+
+    The global convex target is the same grouped BPDN used by
+    :func:`solve_group_basis_pursuit_denoising`, but the full design matrix is
+    never materialised.  Instead, ``group_block_provider(label)`` returns only
+    the columns of one group.  Forward screening repeatedly adds the omitted
+    group giving the largest *conditional* least-squares residual reduction,
+    refitting the current working set after every addition.  Screening stops at
+    the first working set whose unpenalised refit reaches the requested
+    uncertainty ball.  The dense-SVD Douglas--Rachford BPDN reference solver is
+    then run only on that restricted matrix.
+
+    Parameters
+    ----------
+    y
+        Target vector.
+    groups
+        Non-overlapping partition of the global coefficient vector.  The
+        returned ``coefficients`` use exactly these global coordinates.
+    n_coefficients
+        Length of the global coefficient vector.  This is cheap to allocate
+        even when the corresponding global design matrix is too large to form.
+    group_block_provider
+        Callable returning an ``(len(y), len(groups[label]))`` block.  The
+        provider may construct/project a block lazily and discard it after the
+        score is computed.  Only selected blocks are cached by this solver.
+    residual_radius, target_relative_residual
+        Exactly one must be supplied, with the same semantics as the dense BPDN
+        solver.
+    conditional_gain_provider
+        Optional accelerated screening callback.  It receives ``(residual, Q,
+        omitted_labels)`` and must return ``(best_label, best_gain)`` using the
+        same exact conditional-gain criterion.  Problem-specific operator
+        layers can use this hook to batch/vectorise the global scan.
+    restricted_solver_kwargs
+        Keyword arguments forwarded to the dense reference BPDN solve on the
+        screened working set.  By default the restricted tolerance is ``1e-7``;
+        the final support is still certified independently by the caller.
+
+    Notes
+    -----
+    This routine is designed as a large-scale *ranking backend*.  It guarantees
+    that the screened span can explain the data to the requested uncertainty
+    radius before convex ranking is attempted, but it does not claim that tiny
+    coefficients outside the screen are exactly zero in the full BPDN optimum.
+    For TIDES the externally certified ranked-prefix refit remains the decisive
+    support-selection stage.
+    """
+
+    y, groups_clean, group_order = _validate_block_problem(
+        y,
+        groups,
+        n_coefficients=n_coefficients,
+    )
+    weights = _validate_group_weights(group_order, group_weights)
+
+    if (residual_radius is None) == (target_relative_residual is None):
+        raise ValueError(
+            "Supply exactly one of residual_radius or target_relative_residual."
+        )
+
+    y_norm = float(np.linalg.norm(y))
+    if target_relative_residual is not None:
+        relative_target = float(target_relative_residual)
+        if not np.isfinite(relative_target) or relative_target < 0.0:
+            raise ValueError("target_relative_residual must be finite and >= 0.")
+        if y_norm <= np.finfo(float).tiny:
+            raise ValueError(
+                "target_relative_residual is undefined for a zero target; "
+                "supply residual_radius instead."
+            )
+        radius = relative_target * y_norm
+    else:
+        radius = float(residual_radius)
+        if not np.isfinite(radius) or radius < 0.0:
+            raise ValueError("residual_radius must be finite and >= 0.")
+        relative_target = (
+            radius / y_norm if y_norm > np.finfo(float).tiny else np.nan
+        )
+
+    if min_gain_ratio <= 0.0 or not np.isfinite(min_gain_ratio):
+        raise ValueError("min_gain_ratio must be finite and positive.")
+
+    if max_screening_groups is None:
+        max_screening_groups = len(group_order)
+    max_screening_groups = int(min(max_screening_groups, len(group_order)))
+    if max_screening_groups < 1:
+        raise ValueError("max_screening_groups must be >= 1.")
+
+    selected: list[GroupLabel] = []
+    selected_set: set[GroupLabel] = set()
+    selected_blocks: Dict[GroupLabel, Array] = {}
+
+    if initial_groups is not None:
+        for label in initial_groups:
+            if label not in groups_clean:
+                raise KeyError(f"Unknown initial group {label!r}.")
+            if label in selected_set:
+                continue
+            if len(selected) >= max_screening_groups:
+                raise ValueError(
+                    "initial_groups contains more entries than max_screening_groups."
+                )
+            G = _coerce_group_block(
+                label,
+                group_block_provider(label),
+                n_rows=y.size,
+                expected_width=len(groups_clean[label]),
+            )
+            selected.append(label)
+            selected_set.add(label)
+            selected_blocks[label] = G
+
+    coef_screen, residual, rel, rank, cond, Q, A_selected = (
+        _fit_materialised_group_blocks(y, selected, selected_blocks)
+    )
+    initial_energy = float(y @ y)
+    screening_steps = 0
+
+    if verbose:
+        print("Starting screened grouped basis-pursuit denoising...")
+        print(
+            f"  samples={y.size} | global coefficients={int(n_coefficients)} | "
+            f"global groups={len(group_order)}"
+        )
+        print(
+            f"  residual radius={radius:.3e} | "
+            f"relative target={relative_target:.3e}"
+        )
+        print(
+            "  global design=lazy group blocks | "
+            "restricted convex backend=dense-svd Douglas-Rachford"
+        )
+
+    floor_slack = max(
+        100.0 * np.finfo(float).eps,
+        1.0e-12 * max(relative_target, np.finfo(float).tiny),
+    )
+
+    while (
+        rel > relative_target + floor_slack
+        and len(selected) < max_screening_groups
+    ):
+        omitted = tuple(label for label in group_order if label not in selected_set)
+        if not omitted:
+            break
+
+        if conditional_gain_provider is not None:
+            best_group, best_gain = conditional_gain_provider(residual, Q, omitted)
+            if best_group not in groups_clean or best_group in selected_set:
+                raise ValueError(
+                    "conditional_gain_provider returned an invalid/already-selected group."
+                )
+            best_gain = float(best_gain)
+            best_block = _coerce_group_block(
+                best_group,
+                group_block_provider(best_group),
+                n_rows=y.size,
+                expected_width=len(groups_clean[best_group]),
+            )
+        else:
+            best_group = None
+            best_gain = -np.inf
+            best_block = None
+            for label in omitted:
+                G = _coerce_group_block(
+                    label,
+                    group_block_provider(label),
+                    n_rows=y.size,
+                    expected_width=len(groups_clean[label]),
+                )
+                gain = _conditional_group_gain(G, residual, Q)
+                if gain > best_gain:
+                    best_group = label
+                    best_gain = gain
+                    best_block = G
+
+        if (
+            best_group is None
+            or best_block is None
+            or not np.isfinite(best_gain)
+            or best_gain <= min_gain_ratio * max(initial_energy, 1.0)
+        ):
+            break
+
+        selected.append(best_group)
+        selected_set.add(best_group)
+        selected_blocks[best_group] = best_block
+        screening_steps += 1
+
+        coef_screen, residual, rel, rank, cond, Q, A_selected = (
+            _fit_materialised_group_blocks(y, selected, selected_blocks)
+        )
+
+        if verbose and (
+            screening_steps <= 5
+            or screening_steps % 5 == 0
+            or rel <= relative_target + floor_slack
+        ):
+            print(
+                f"  [screen {screening_steps:4d}] "
+                f"groups={len(selected):5d} | post-rel={rel:.3e} | "
+                f"added={best_group!r}"
+            )
+
+    screening_groups = tuple(selected)
+    screening_rel = float(rel)
+    screening_floor_reached = bool(rel <= relative_target + floor_slack)
+
+    if not screening_floor_reached:
+        raise RuntimeError(
+            "Conditional screening did not reach the requested residual ball: "
+            f"post-refit relative residual={screening_rel:.6e}, "
+            f"target={relative_target:.6e}, groups={len(screening_groups)}."
+        )
+
+    # Build the restricted matrix in *screening order*.  Only these columns are
+    # retained in memory; the global design never exists as a dense array.
+    A_work = np.column_stack([selected_blocks[label] for label in screening_groups])
+    local_groups: Dict[GroupLabel, Array] = {}
+    local_weights: Dict[GroupLabel, float] = {}
+    offset = 0
+    for label in screening_groups:
+        width = len(groups_clean[label])
+        local_groups[label] = np.arange(offset, offset + width, dtype=int)
+        local_weights[label] = float(weights[label])
+        offset += width
+
+    restricted_kwargs = (
+        {} if restricted_solver_kwargs is None else dict(restricted_solver_kwargs)
+    )
+    forbidden = {"residual_radius", "target_relative_residual", "group_weights"}.intersection(
+        restricted_kwargs
+    )
+    if forbidden:
+        raise ValueError(
+            "restricted_solver_kwargs must not override the uncertainty radius "
+            f"or group weights; forbidden keys={sorted(forbidden)!r}."
+        )
+    restricted_kwargs.setdefault("max_iter", 10000)
+    restricted_kwargs.setdefault("tol", 1.0e-7)
+    restricted_kwargs.setdefault("check_every", 50)
+    restricted_kwargs.setdefault("verbose", verbose)
+
+    if verbose:
+        print("Conditional feasibility screen complete.")
+        print(
+            f"  screened groups={len(screening_groups)} | "
+            f"restricted columns={A_work.shape[1]} | post-rel={screening_rel:.3e}"
+        )
+        print("Starting restricted convex BPDN ranking...")
+
+    restricted = solve_group_basis_pursuit_denoising(
+        A_work,
+        y,
+        local_groups,
+        residual_radius=radius,
+        group_weights=local_weights,
+        **restricted_kwargs,
+    )
+
+    if require_restricted_convergence and not restricted.converged:
+        raise RuntimeError(
+            "Restricted grouped BPDN did not converge.  Increase the restricted "
+            "iteration budget or relax only the numerical fixed-point tolerance."
+        )
+    if not restricted.feasible:
+        raise RuntimeError(
+            "Restricted grouped BPDN returned a point outside the requested "
+            "uncertainty ball."
+        )
+
+    coefficients = np.zeros(int(n_coefficients), dtype=float)
+    scores = {label: 0.0 for label in group_order}
+    for label in screening_groups:
+        local = local_groups[label]
+        global_idx = groups_clean[label]
+        coefficients[global_idx] = restricted.coefficients[local]
+        scores[label] = float(np.linalg.norm(restricted.coefficients[local]))
+
+    order_index = {label: i for i, label in enumerate(group_order)}
+    ranking = tuple(
+        sorted(
+            group_order,
+            key=lambda label: (-scores[label], order_index[label]),
+        )
+    )
+    objective = float(
+        sum(weights[label] * scores[label] for label in group_order)
+    )
+
+    # Prediction can be evaluated from the restricted matrix directly.
+    prediction = A_work @ restricted.coefficients
+    residual_norm = float(np.linalg.norm(prediction - y))
+    relative_residual = (
+        residual_norm / y_norm if y_norm > np.finfo(float).tiny else np.nan
+    )
+    feasibility_tol = max(
+        100.0 * np.finfo(float).eps * max(y_norm, radius, 1.0),
+        1.0e-12 * max(radius, 1.0),
+    )
+    feasible = bool(residual_norm <= radius + feasibility_tol)
+    converged = bool(restricted.converged and feasible)
+    stop_reason = (
+        "conditional screen reached uncertainty ball; restricted BPDN converged"
+        if converged
+        else "restricted screened BPDN incomplete"
+    )
+
+    if verbose:
+        print("Screened grouped basis-pursuit denoising complete.")
+        print(f"  stop reason={stop_reason}")
+        print(
+            f"  global groups={len(group_order)} | screened={len(screening_groups)} | "
+            f"restricted columns={A_work.shape[1]}"
+        )
+        print(
+            f"  relative residual={relative_residual:.3e} | "
+            f"objective={objective:.6e} | feasible={feasible}"
+        )
+
+    return ScreenedGroupBasisPursuitResult(
+        coefficients=coefficients.copy(),
+        group_scores=dict(scores),
+        ranking=tuple(ranking),
+        objective_value=float(objective),
+        residual_norm=float(residual_norm),
+        relative_residual=float(relative_residual),
+        residual_radius=float(radius),
+        target_relative_residual=float(relative_target),
+        feasible=bool(feasible),
+        converged=bool(converged),
+        stop_reason=str(stop_reason),
+        group_weights=dict(weights),
+        screening_groups=tuple(screening_groups),
+        screening_relative_residual=float(screening_rel),
+        screening_steps=int(screening_steps),
+        screening_rank=int(rank),
+        screening_condition_number=float(cond),
+        restricted_result=restricted,
+        n_global_groups=int(len(group_order)),
+        n_restricted_groups=int(len(screening_groups)),
+        peak_restricted_columns=int(A_work.shape[1]),
+    )
+
+
+# Concise alias for the scalable screened ranking backend.
+solve_screened_group_bpdn = solve_screened_group_basis_pursuit_denoising
+
+
+# -----------------------------------------------------------------------------
 # Post-selection refit
 # -----------------------------------------------------------------------------
 
@@ -1620,6 +2710,12 @@ def solve_adaptive_group_lasso(
 
 
 __all__ = [
+    "GroupBasisPursuitResult",
+    "ScreenedGroupBasisPursuitResult",
+    "solve_group_basis_pursuit_denoising",
+    "solve_group_bpdn",
+    "solve_screened_group_basis_pursuit_denoising",
+    "solve_screened_group_bpdn",
     "AdaptiveGroupLassoPathPoint",
     "AdaptiveGroupLassoResult",
     "ForwardBackwardGroupSearchResult",

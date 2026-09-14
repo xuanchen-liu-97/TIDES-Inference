@@ -31,6 +31,12 @@ Douglas--Rachford BPDN solver only on that restricted matrix.  Problem-specific
 operator layers may provide a batched conditional-gain callback so the global
 scan can also be evaluated without materialising all candidate blocks.
 
+The newer ``solve_working_set_group_basis_pursuit_denoising`` keeps the same
+full grouped-BPDN objective but replaces one-at-a-time conditional screening by
+batched feasibility seeding followed by global convex-dual/KKT audits.  Omitted
+groups violating ``||A_g^T u||_2 <= w_g`` are reactivated until the full convex
+problem is globally certified.
+
 Legacy baselines
 ----------------
 The previous Adaptive Group LASSO and forward/backward floor search are retained
@@ -156,6 +162,18 @@ class GroupBasisPursuitResult:
     design_rank: int
     design_singular_values: Array
     irreducible_residual_norm: float
+
+    # Convex-dual diagnostics.  ``dual_vector`` is recovered from the
+    # Douglas--Rachford fixed point and rescaled, if necessary, to be dual-feasible
+    # for the design supplied to this solve.  A larger working-set wrapper may
+    # still find omitted-group violations outside that restricted design.
+    dual_vector: Optional[Array] = None
+    dual_objective: float = np.nan
+    duality_gap: float = np.nan
+    max_dual_group_ratio: float = np.nan
+    dual_feasible: bool = False
+    projection_kkt_multiplier: float = np.nan
+
     projection_backend: str = "dense-svd"
     selection_method: str = "group-bpdn-ranking"
 
@@ -208,6 +226,68 @@ class ScreenedGroupBasisPursuitResult:
     peak_restricted_columns: int
     projection_backend: str = "screened-dense-svd"
     selection_method: str = "screened-group-bpdn-ranking"
+
+
+@dataclass(frozen=True)
+class BPDNWorkingSetAuditPoint:
+    """One globally audited working-set BPDN solve."""
+
+    audit_index: int
+    working_set_size: int
+    restricted_objective: float
+    restricted_relative_residual: float
+    max_global_dual_ratio: float
+    n_violations: int
+    n_reactivated: int
+    restricted_duality_gap: float
+
+
+@dataclass(frozen=True)
+class WorkingSetGroupBasisPursuitResult:
+    """Globally dual-certified grouped BPDN solved through a working set.
+
+    A small floor-feasible working set is built first.  The ordinary dense-SVD
+    grouped-BPDN reference solver is then applied on the restricted design.  Its
+    dual vector is audited against *all* omitted groups.  Any violating groups
+    are reactivated and the process repeats until the full grouped-BPDN dual
+    constraints are satisfied.
+
+    The returned ranking is therefore a ranking for the globally certified full
+    convex problem, not merely for the initial screened subproblem.
+    """
+
+    coefficients: Array
+    group_scores: Dict[GroupLabel, float]
+    ranking: Tuple[GroupLabel, ...]
+    objective_value: float
+    residual_norm: float
+    relative_residual: float
+    residual_radius: float
+    target_relative_residual: float
+    feasible: bool
+    converged: bool
+    stop_reason: str
+    group_weights: Dict[GroupLabel, float]
+
+    seed_groups: Tuple[GroupLabel, ...]
+    working_set: Tuple[GroupLabel, ...]
+    n_global_groups: int
+    n_restricted_groups: int
+    peak_restricted_columns: int
+    seed_scans: int
+    kkt_audits: int
+    working_set_expansions: int
+    total_reactivations: int
+    max_global_dual_ratio: float
+    global_dual_feasible: bool
+    global_dual_vector: Optional[Array]
+    global_dual_objective: float
+    global_duality_gap: float
+    restricted_result: GroupBasisPursuitResult
+    audit_path: Tuple[BPDNWorkingSetAuditPoint, ...]
+
+    projection_backend: str = "working-set-dense-svd"
+    selection_method: str = "working-set-group-bpdn-ranking"
 
 
 # -----------------------------------------------------------------------------
@@ -1194,7 +1274,22 @@ class _DenseResidualBallProjector:
                 f"{self.radius:.3e}."
             )
 
-    def project(self, beta: Array) -> Array:
+    def _project_with_multiplier(self, beta: Array) -> Tuple[Array, float]:
+        """Project onto the residual ball and return its squared-norm KKT multiplier.
+
+        The projection solves
+
+            min_x 0.5 ||x-beta||_2^2
+            s.t.  ||X x-y||_2 <= radius.
+
+        On an active boundary the returned ``lam`` satisfies
+
+            beta - x = lam * X^T (X x - y).
+
+        This multiplier is later combined with the Douglas--Rachford proximal
+        step to recover a convex-dual vector for grouped BPDN.
+        """
+
         beta = np.asarray(beta, dtype=float).reshape(-1)
         coordinates = self.Vt @ beta
         active_residual = self.singular * coordinates - self.Uty
@@ -1204,7 +1299,7 @@ class _DenseResidualBallProjector:
         )
 
         if residual_squared <= self.radius * self.radius:
-            return beta.copy()
+            return beta.copy(), 0.0
 
         target_active_squared = max(
             self.radius * self.radius - self.irreducible_residual_squared,
@@ -1212,16 +1307,15 @@ class _DenseResidualBallProjector:
         )
         if target_active_squared <= 0.0:
             # Exact projection onto the closest point in the column space.  The
-            # formal infinite-multiplier limit is numerically represented by
-            # removing all residual components associated with nonzero singular
-            # values.  This branch is uncommon for TIDES because the supplied
-            # uncertainty radius is positive.
+            # formal multiplier is infinite in this limiting case, so the primal
+            # projection is still returned while dual recovery is disabled.
             nonzero = self.singular > 0.0
             correction = np.zeros_like(active_residual)
             correction[nonzero] = (
                 active_residual[nonzero] / self.singular[nonzero]
             )
-            return beta - self.Vt.T @ correction
+            projected = beta - self.Vt.T @ correction
+            return projected, np.inf
 
         def secular(lam: float) -> float:
             denominator = 1.0 + lam * self.singular_squared
@@ -1268,7 +1362,16 @@ class _DenseResidualBallProjector:
             / denominator
             * active_residual
         )
-        return beta - self.Vt.T @ correction_svd
+        projected = beta - self.Vt.T @ correction_svd
+        return projected, float(lam)
+
+    def project(self, beta: Array) -> Array:
+        projected, _ = self._project_with_multiplier(beta)
+        return projected
+
+    def project_with_multiplier(self, beta: Array) -> Tuple[Array, float]:
+        """Public internal helper used for BPDN dual recovery."""
+        return self._project_with_multiplier(beta)
 
 
 def _default_douglas_rachford_step(
@@ -1445,10 +1548,12 @@ def solve_group_basis_pursuit_denoising(
                 break
 
     # Recompute the final shadow point after the last state update so all
-    # reported quantities correspond to the returned coefficient vector.
-    coefficients = projector.project(state)
+    # reported quantities correspond to the returned coefficient vector.  The
+    # projection multiplier plus the DR proximal step recover a dual vector.
+    coefficients, projection_multiplier = projector.project_with_multiplier(state)
     prediction = X_raw @ coefficients
-    residual_norm = float(np.linalg.norm(prediction - y))
+    residual_vector = y - prediction
+    residual_norm = float(np.linalg.norm(residual_vector))
     relative_residual = (
         residual_norm / y_norm if y_norm > np.finfo(float).tiny else np.nan
     )
@@ -1473,6 +1578,55 @@ def solve_group_basis_pursuit_denoising(
         sum(weights[label] * scores[label] for label in group_order)
     )
 
+    # Recover a dual vector from the Douglas--Rachford fixed point.  At a fixed
+    # point, if ``lam_proj`` is the residual-ball projection multiplier and
+    # ``gamma`` the DR proximal step, then
+    #
+    #     u_raw = (lam_proj / gamma) * (y - X beta)
+    #
+    # satisfies X^T u in the subgradient of the grouped l2,1 norm.  Numerical
+    # fixed-point error can make the raw vector slightly infeasible, so scale it
+    # by the largest supplied-design dual-group ratio.  This preserves direction
+    # and yields a valid dual lower bound.
+    dual_vector: Optional[Array]
+    dual_objective = np.nan
+    duality_gap = np.nan
+    max_dual_ratio = np.nan
+    dual_feasible = False
+
+    if (
+        np.isfinite(projection_multiplier)
+        and projection_multiplier >= 0.0
+        and np.isfinite(dr_step)
+        and dr_step > 0.0
+    ):
+        dual_raw = (float(projection_multiplier) / float(dr_step)) * residual_vector
+        Xt_dual = X_raw.T @ dual_raw
+        ratios = [
+            float(np.linalg.norm(Xt_dual[groups_clean[label]]))
+            / float(weights[label])
+            for label in group_order
+        ]
+        raw_max_ratio = max(ratios, default=0.0)
+        dual_scale = max(1.0, raw_max_ratio)
+        dual_vector = np.asarray(dual_raw / dual_scale, dtype=float)
+
+        Xt_dual_feasible = X_raw.T @ dual_vector
+        feasible_ratios = [
+            float(np.linalg.norm(Xt_dual_feasible[groups_clean[label]]))
+            / float(weights[label])
+            for label in group_order
+        ]
+        max_dual_ratio = max(feasible_ratios, default=0.0)
+        dual_feasible = bool(max_dual_ratio <= 1.0 + 100.0 * np.finfo(float).eps)
+        if dual_feasible:
+            dual_objective = float(
+                y @ dual_vector - radius * np.linalg.norm(dual_vector)
+            )
+            duality_gap = float(max(objective_value - dual_objective, 0.0))
+    else:
+        dual_vector = None
+
     if not feasible:
         converged = False
         stop_reason = "returned shadow iterate violates residual radius"
@@ -1488,6 +1642,11 @@ def solve_group_basis_pursuit_denoising(
             f"  relative residual={relative_residual:.3e} | "
             f"objective={objective_value:.6e}"
         )
+        if dual_vector is not None:
+            print(
+                f"  dual max-ratio={max_dual_ratio:.6e} | "
+                f"duality gap={duality_gap:.3e}"
+            )
 
     return GroupBasisPursuitResult(
         coefficients=coefficients.copy(),
@@ -1508,6 +1667,12 @@ def solve_group_basis_pursuit_denoising(
         design_rank=int(projector.design_rank),
         design_singular_values=projector.singular_values_full.copy(),
         irreducible_residual_norm=float(projector.irreducible_residual_norm),
+        dual_vector=None if dual_vector is None else dual_vector.copy(),
+        dual_objective=float(dual_objective),
+        duality_gap=float(duality_gap),
+        max_dual_group_ratio=float(max_dual_ratio),
+        dual_feasible=bool(dual_feasible),
+        projection_kkt_multiplier=float(projection_multiplier),
     )
 
 
@@ -2049,6 +2214,566 @@ def solve_screened_group_basis_pursuit_denoising(
 
 # Concise alias for the scalable screened ranking backend.
 solve_screened_group_bpdn = solve_screened_group_basis_pursuit_denoising
+
+
+# -----------------------------------------------------------------------------
+# Globally dual-certified working-set BPDN
+# -----------------------------------------------------------------------------
+
+
+def _working_set_group_adjoint_norms(
+    vector: Array,
+    labels: Sequence[GroupLabel],
+    groups: Mapping[GroupLabel, Array],
+    group_block_provider: Callable[[GroupLabel], Array],
+    *,
+    n_rows: int,
+    group_adjoint_norm_provider: Optional[
+        Callable[[Array, Tuple[GroupLabel, ...]], Mapping[GroupLabel, float]]
+    ] = None,
+) -> Dict[GroupLabel, float]:
+    """Return ``||A_g^T vector||_2`` for a batch of groups.
+
+    A problem-specific operator may supply ``group_adjoint_norm_provider`` to
+    evaluate all requested groups in one structured pass.  The generic fallback
+    materialises each block lazily and is intended for correctness tests only.
+    """
+
+    vector = np.asarray(vector, dtype=float).reshape(-1)
+    if vector.size != int(n_rows):
+        raise ValueError("adjoint-norm vector has incompatible length.")
+
+    labels_tuple = tuple(labels)
+    if not labels_tuple:
+        return {}
+
+    if group_adjoint_norm_provider is not None:
+        raw = group_adjoint_norm_provider(vector, labels_tuple)
+        if set(raw.keys()) != set(labels_tuple):
+            missing = set(labels_tuple) - set(raw.keys())
+            extra = set(raw.keys()) - set(labels_tuple)
+            raise ValueError(
+                "group_adjoint_norm_provider must return exactly the requested "
+                f"labels; missing={list(missing)[:10]!r}, extra={list(extra)[:10]!r}."
+            )
+        out: Dict[GroupLabel, float] = {}
+        for label in labels_tuple:
+            value = float(raw[label])
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"Adjoint norm for group {label!r} must be finite and non-negative."
+                )
+            out[label] = value
+        return out
+
+    out: Dict[GroupLabel, float] = {}
+    for label in labels_tuple:
+        G = _coerce_group_block(
+            label,
+            group_block_provider(label),
+            n_rows=n_rows,
+            expected_width=len(groups[label]),
+        )
+        out[label] = float(np.linalg.norm(G.T @ vector))
+    return out
+
+
+def _working_set_local_problem(
+    selected: Sequence[GroupLabel],
+    selected_blocks: Mapping[GroupLabel, Array],
+    groups: Mapping[GroupLabel, Array],
+    weights: Mapping[GroupLabel, float],
+) -> Tuple[Array, Dict[GroupLabel, Array], Dict[GroupLabel, float]]:
+    """Assemble one restricted dense grouped problem in working-set order."""
+
+    A_work = np.column_stack([selected_blocks[label] for label in selected])
+    local_groups: Dict[GroupLabel, Array] = {}
+    local_weights: Dict[GroupLabel, float] = {}
+    offset = 0
+    for label in selected:
+        width = len(groups[label])
+        local_groups[label] = np.arange(offset, offset + width, dtype=int)
+        local_weights[label] = float(weights[label])
+        offset += width
+    return A_work, local_groups, local_weights
+
+
+def solve_working_set_group_basis_pursuit_denoising(
+    y: Array,
+    groups: Mapping[GroupLabel, Sequence[int]],
+    *,
+    n_coefficients: int,
+    group_block_provider: Callable[[GroupLabel], Array],
+    residual_radius: Optional[float] = None,
+    target_relative_residual: Optional[float] = None,
+    group_weights: Optional[Mapping[GroupLabel, float]] = None,
+    group_adjoint_norm_provider: Optional[
+        Callable[[Array, Tuple[GroupLabel, ...]], Mapping[GroupLabel, float]]
+    ] = None,
+    initial_groups: Optional[Sequence[GroupLabel]] = None,
+    seed_batch_size: int = 16,
+    seed_growth_factor: float = 2.0,
+    max_seed_scans: int = 20,
+    max_seed_groups: Optional[int] = None,
+    kkt_tol: float = 1e-7,
+    max_working_set_expansions: int = 50,
+    max_reactivation_groups: Optional[int] = None,
+    restricted_solver_kwargs: Optional[Mapping[str, object]] = None,
+    require_restricted_convergence: bool = True,
+    verbose: bool = True,
+) -> WorkingSetGroupBasisPursuitResult:
+    """Solve the *full* grouped BPDN through a globally audited working set.
+
+    The statistical target is exactly
+
+        minimise    sum_g w_g ||beta_g||_2
+        subject to  ||y - A beta||_2 <= delta.
+
+    The global design need not be materialised.  A floor-feasible seed working
+    set is built in batches from group correlations.  The ordinary dense-SVD
+    Douglas--Rachford BPDN solver is then run on that restricted matrix.  Its
+    recovered dual vector is audited against every omitted group through
+    ``||A_g^T u||_2 <= w_g``.  Violating groups are reactivated in batches and
+    the restricted problem is re-solved until no global violation remains.
+
+    Unlike ``solve_screened_group_basis_pursuit_denoising``, successful return
+    therefore certifies the full convex grouped-BPDN optimum up to the supplied
+    numerical KKT tolerance and the restricted solver tolerance.
+
+    ``group_adjoint_norm_provider`` is the key large-scale hook: it should return
+    raw norms ``||A_g^T v||_2`` for all requested groups without materialising
+    the global design.  If omitted, a slow block-by-block correctness fallback
+    is used.
+    """
+
+    y, groups_clean, group_order = _validate_block_problem(
+        y,
+        groups,
+        n_coefficients=n_coefficients,
+    )
+    weights = _validate_group_weights(group_order, group_weights)
+
+    if (residual_radius is None) == (target_relative_residual is None):
+        raise ValueError(
+            "Supply exactly one of residual_radius or target_relative_residual."
+        )
+
+    y_norm = float(np.linalg.norm(y))
+    if target_relative_residual is not None:
+        relative_target = float(target_relative_residual)
+        if not np.isfinite(relative_target) or relative_target < 0.0:
+            raise ValueError("target_relative_residual must be finite and >= 0.")
+        if y_norm <= np.finfo(float).tiny:
+            raise ValueError(
+                "target_relative_residual is undefined for a zero target; "
+                "supply residual_radius instead."
+            )
+        radius = relative_target * y_norm
+    else:
+        radius = float(residual_radius)
+        if not np.isfinite(radius) or radius < 0.0:
+            raise ValueError("residual_radius must be finite and >= 0.")
+        relative_target = (
+            radius / y_norm if y_norm > np.finfo(float).tiny else np.nan
+        )
+
+    if seed_batch_size < 1:
+        raise ValueError("seed_batch_size must be >= 1.")
+    if not np.isfinite(seed_growth_factor) or seed_growth_factor < 1.0:
+        raise ValueError("seed_growth_factor must be finite and >= 1.")
+    if max_seed_scans < 1:
+        raise ValueError("max_seed_scans must be >= 1.")
+    if not np.isfinite(kkt_tol) or kkt_tol < 0.0:
+        raise ValueError("kkt_tol must be finite and non-negative.")
+    if max_working_set_expansions < 0:
+        raise ValueError("max_working_set_expansions must be >= 0.")
+    if max_reactivation_groups is not None and int(max_reactivation_groups) < 1:
+        raise ValueError("max_reactivation_groups must be >= 1 when supplied.")
+
+    if max_seed_groups is None:
+        seed_cap = len(group_order)
+    else:
+        seed_cap = min(int(max_seed_groups), len(group_order))
+        if seed_cap < 1:
+            raise ValueError("max_seed_groups must be >= 1 when supplied.")
+
+    selected: list[GroupLabel] = []
+    selected_set: set[GroupLabel] = set()
+    selected_blocks: Dict[GroupLabel, Array] = {}
+    order_index = {label: i for i, label in enumerate(group_order)}
+
+    if initial_groups is not None:
+        for label in initial_groups:
+            if label not in groups_clean:
+                raise KeyError(f"Unknown initial group {label!r}.")
+            if label in selected_set:
+                continue
+            if len(selected) >= seed_cap:
+                raise ValueError(
+                    "initial_groups contains more entries than max_seed_groups."
+                )
+            G = _coerce_group_block(
+                label,
+                group_block_provider(label),
+                n_rows=y.size,
+                expected_width=len(groups_clean[label]),
+            )
+            selected.append(label)
+            selected_set.add(label)
+            selected_blocks[label] = G
+
+    _, residual, rel, _, _, _, _ = _fit_materialised_group_blocks(
+        y, selected, selected_blocks
+    )
+    floor_slack = max(
+        100.0 * np.finfo(float).eps,
+        1.0e-12 * max(relative_target, np.finfo(float).tiny),
+    )
+
+    if verbose:
+        print("Starting working-set grouped basis-pursuit denoising...")
+        print(
+            f"  samples={y.size} | global coefficients={int(n_coefficients)} | "
+            f"global groups={len(group_order)}"
+        )
+        print(
+            f"  residual radius={radius:.3e} | "
+            f"relative target={relative_target:.3e}"
+        )
+        print(
+            "  phase 1=batch floor-feasible seed | "
+            "phase 2=restricted BPDN + global dual/KKT audit"
+        )
+
+    seed_scans = 0
+    batch_size = int(seed_batch_size)
+    while rel > relative_target + floor_slack and len(selected) < seed_cap:
+        omitted = tuple(label for label in group_order if label not in selected_set)
+        if not omitted:
+            break
+        if seed_scans >= max_seed_scans:
+            break
+
+        norms = _working_set_group_adjoint_norms(
+            residual,
+            omitted,
+            groups_clean,
+            group_block_provider,
+            n_rows=y.size,
+            group_adjoint_norm_provider=group_adjoint_norm_provider,
+        )
+        scored = sorted(
+            omitted,
+            key=lambda label: (
+                -float(norms[label]) / float(weights[label]),
+                order_index[label],
+            ),
+        )
+        n_add = min(batch_size, seed_cap - len(selected), len(scored))
+        to_add = scored[:n_add]
+        if not to_add:
+            break
+
+        for label in to_add:
+            G = _coerce_group_block(
+                label,
+                group_block_provider(label),
+                n_rows=y.size,
+                expected_width=len(groups_clean[label]),
+            )
+            selected.append(label)
+            selected_set.add(label)
+            selected_blocks[label] = G
+
+        _, residual, rel, _, _, _, _ = _fit_materialised_group_blocks(
+            y, selected, selected_blocks
+        )
+        seed_scans += 1
+        if verbose:
+            print(
+                f"  [seed {seed_scans:3d}] groups={len(selected):5d} | "
+                f"post-rel={rel:.3e} | added={len(to_add)}"
+            )
+        batch_size = max(
+            batch_size + 1,
+            int(np.ceil(batch_size * float(seed_growth_factor))),
+        )
+
+    if rel > relative_target + floor_slack:
+        raise RuntimeError(
+            "Batch seed construction did not reach the requested residual ball: "
+            f"post-refit relative residual={rel:.6e}, target={relative_target:.6e}, "
+            f"groups={len(selected)}, seed_scans={seed_scans}."
+        )
+
+    seed_groups = tuple(selected)
+    restricted_kwargs = (
+        {} if restricted_solver_kwargs is None else dict(restricted_solver_kwargs)
+    )
+    forbidden = {
+        "residual_radius",
+        "target_relative_residual",
+        "group_weights",
+    }.intersection(restricted_kwargs)
+    if forbidden:
+        raise ValueError(
+            "restricted_solver_kwargs must not override the uncertainty radius "
+            f"or group weights; forbidden keys={sorted(forbidden)!r}."
+        )
+    restricted_kwargs.setdefault("max_iter", 10000)
+    restricted_kwargs.setdefault("tol", 1.0e-8)
+    restricted_kwargs.setdefault("check_every", 50)
+    restricted_kwargs.setdefault("verbose", verbose)
+
+    audit_path: list[BPDNWorkingSetAuditPoint] = []
+    total_reactivations = 0
+    expansions = 0
+    kkt_audits = 0
+    peak_columns = 0
+    final_restricted: Optional[GroupBasisPursuitResult] = None
+    final_max_global_ratio = np.inf
+    global_dual_feasible = False
+    final_global_dual: Optional[Array] = None
+    final_global_dual_objective = np.nan
+    final_global_duality_gap = np.nan
+
+    while True:
+        A_work, local_groups, local_weights = _working_set_local_problem(
+            selected,
+            selected_blocks,
+            groups_clean,
+            weights,
+        )
+        peak_columns = max(peak_columns, int(A_work.shape[1]))
+
+        if verbose:
+            print(
+                f"Starting restricted BPDN on working set: "
+                f"groups={len(selected)} | columns={A_work.shape[1]}"
+            )
+
+        restricted = solve_group_basis_pursuit_denoising(
+            A_work,
+            y,
+            local_groups,
+            residual_radius=radius,
+            group_weights=local_weights,
+            **restricted_kwargs,
+        )
+        final_restricted = restricted
+
+        if require_restricted_convergence and not restricted.converged:
+            raise RuntimeError(
+                "Restricted grouped BPDN did not converge during working-set "
+                "certification. Increase only the numerical iteration budget or "
+                "adjust the numerical fixed-point tolerance."
+            )
+        if not restricted.feasible:
+            raise RuntimeError(
+                "Restricted grouped BPDN returned a point outside the requested "
+                "uncertainty ball."
+            )
+        if restricted.dual_vector is None or not restricted.dual_feasible:
+            raise RuntimeError(
+                "Restricted grouped BPDN did not produce a usable dual vector; "
+                "global working-set certification cannot proceed."
+            )
+
+        dual = np.asarray(restricted.dual_vector, dtype=float)
+        omitted = tuple(label for label in group_order if label not in selected_set)
+        omitted_norms = _working_set_group_adjoint_norms(
+            dual,
+            omitted,
+            groups_clean,
+            group_block_provider,
+            n_rows=y.size,
+            group_adjoint_norm_provider=group_adjoint_norm_provider,
+        )
+        kkt_audits += 1
+
+        omitted_ratios = {
+            label: float(omitted_norms[label]) / float(weights[label])
+            for label in omitted
+        }
+        max_omitted_ratio = max(omitted_ratios.values(), default=0.0)
+        final_max_global_ratio = max(
+            float(restricted.max_dual_group_ratio),
+            float(max_omitted_ratio),
+        )
+
+        violations = [
+            (label, ratio)
+            for label, ratio in omitted_ratios.items()
+            if ratio > 1.0 + float(kkt_tol)
+        ]
+        violations.sort(key=lambda item: (-item[1], order_index[item[0]]))
+
+        if max_reactivation_groups is not None:
+            violations_to_add = violations[: int(max_reactivation_groups)]
+        else:
+            violations_to_add = violations
+
+        audit_path.append(
+            BPDNWorkingSetAuditPoint(
+                audit_index=int(kkt_audits),
+                working_set_size=int(len(selected)),
+                restricted_objective=float(restricted.objective_value),
+                restricted_relative_residual=float(restricted.relative_residual),
+                max_global_dual_ratio=float(final_max_global_ratio),
+                n_violations=int(len(violations)),
+                n_reactivated=int(len(violations_to_add)),
+                restricted_duality_gap=float(restricted.duality_gap),
+            )
+        )
+
+        if verbose:
+            print(
+                f"  [audit {kkt_audits:3d}] max dual ratio="
+                f"{final_max_global_ratio:.6e} | violations={len(violations)}"
+            )
+
+        if not violations:
+            # ``kkt_tol`` permits a tiny ratio above one.  Rescale once more by
+            # the audited global maximum so the stored dual vector is genuinely
+            # feasible and its objective is a valid lower bound.
+            global_scale = max(1.0, float(final_max_global_ratio))
+            final_global_dual = np.asarray(dual / global_scale, dtype=float)
+            global_dual_feasible = True
+            final_global_dual_objective = float(
+                y @ final_global_dual
+                - radius * np.linalg.norm(final_global_dual)
+            )
+            final_global_duality_gap = float(
+                max(
+                    restricted.objective_value - final_global_dual_objective,
+                    0.0,
+                )
+            )
+            break
+
+        if expansions >= max_working_set_expansions:
+            raise RuntimeError(
+                "Working-set grouped BPDN exceeded max_working_set_expansions="
+                f"{max_working_set_expansions}; remaining violations="
+                f"{len(violations)}, max global dual ratio="
+                f"{final_max_global_ratio:.6e}."
+            )
+
+        if not violations_to_add:
+            raise RuntimeError(
+                "Global dual violations were detected but no groups were selected "
+                "for reactivation."
+            )
+
+        for label, _ in violations_to_add:
+            if label in selected_set:
+                continue
+            G = _coerce_group_block(
+                label,
+                group_block_provider(label),
+                n_rows=y.size,
+                expected_width=len(groups_clean[label]),
+            )
+            selected.append(label)
+            selected_set.add(label)
+            selected_blocks[label] = G
+
+        added = len(violations_to_add)
+        total_reactivations += added
+        expansions += 1
+
+    assert final_restricted is not None
+
+    coefficients = np.zeros(int(n_coefficients), dtype=float)
+    scores = {label: 0.0 for label in group_order}
+    A_work, local_groups, _ = _working_set_local_problem(
+        selected,
+        selected_blocks,
+        groups_clean,
+        weights,
+    )
+    for label in selected:
+        local = local_groups[label]
+        global_idx = groups_clean[label]
+        coefficients[global_idx] = final_restricted.coefficients[local]
+        scores[label] = float(np.linalg.norm(final_restricted.coefficients[local]))
+
+    ranking = tuple(
+        sorted(
+            group_order,
+            key=lambda label: (-scores[label], order_index[label]),
+        )
+    )
+    objective = float(sum(weights[label] * scores[label] for label in group_order))
+    prediction = A_work @ final_restricted.coefficients
+    residual_norm = float(np.linalg.norm(prediction - y))
+    relative_residual = (
+        residual_norm / y_norm if y_norm > np.finfo(float).tiny else np.nan
+    )
+    feasibility_tol = max(
+        100.0 * np.finfo(float).eps * max(y_norm, radius, 1.0),
+        1.0e-12 * max(radius, 1.0),
+    )
+    feasible = bool(residual_norm <= radius + feasibility_tol)
+    converged = bool(
+        feasible
+        and final_restricted.converged
+        and global_dual_feasible
+        and final_max_global_ratio <= 1.0 + float(kkt_tol)
+    )
+    stop_reason = (
+        "global grouped-BPDN dual/KKT certificate satisfied"
+        if converged
+        else "working-set grouped BPDN incomplete"
+    )
+
+    if verbose:
+        print("Working-set grouped basis-pursuit denoising complete.")
+        print(f"  stop reason={stop_reason}")
+        print(
+            f"  seed groups={len(seed_groups)} | final working set={len(selected)} | "
+            f"reactivations={total_reactivations} | audits={kkt_audits}"
+        )
+        print(
+            f"  max global dual ratio={final_max_global_ratio:.6e} | "
+            f"global duality gap={final_global_duality_gap:.3e}"
+        )
+
+    return WorkingSetGroupBasisPursuitResult(
+        coefficients=coefficients.copy(),
+        group_scores=dict(scores),
+        ranking=tuple(ranking),
+        objective_value=float(objective),
+        residual_norm=float(residual_norm),
+        relative_residual=float(relative_residual),
+        residual_radius=float(radius),
+        target_relative_residual=float(relative_target),
+        feasible=bool(feasible),
+        converged=bool(converged),
+        stop_reason=str(stop_reason),
+        group_weights=dict(weights),
+        seed_groups=tuple(seed_groups),
+        working_set=tuple(selected),
+        n_global_groups=int(len(group_order)),
+        n_restricted_groups=int(len(selected)),
+        peak_restricted_columns=int(peak_columns),
+        seed_scans=int(seed_scans),
+        kkt_audits=int(kkt_audits),
+        working_set_expansions=int(expansions),
+        total_reactivations=int(total_reactivations),
+        max_global_dual_ratio=float(final_max_global_ratio),
+        global_dual_feasible=bool(global_dual_feasible),
+        global_dual_vector=(
+            None if final_global_dual is None else final_global_dual.copy()
+        ),
+        global_dual_objective=float(final_global_dual_objective),
+        global_duality_gap=float(final_global_duality_gap),
+        restricted_result=final_restricted,
+        audit_path=tuple(audit_path),
+    )
+
+
+solve_working_set_group_bpdn = solve_working_set_group_basis_pursuit_denoising
 
 
 # -----------------------------------------------------------------------------
@@ -2712,10 +3437,14 @@ def solve_adaptive_group_lasso(
 __all__ = [
     "GroupBasisPursuitResult",
     "ScreenedGroupBasisPursuitResult",
+    "BPDNWorkingSetAuditPoint",
+    "WorkingSetGroupBasisPursuitResult",
     "solve_group_basis_pursuit_denoising",
     "solve_group_bpdn",
     "solve_screened_group_basis_pursuit_denoising",
     "solve_screened_group_bpdn",
+    "solve_working_set_group_basis_pursuit_denoising",
+    "solve_working_set_group_bpdn",
     "AdaptiveGroupLassoPathPoint",
     "AdaptiveGroupLassoResult",
     "ForwardBackwardGroupSearchResult",

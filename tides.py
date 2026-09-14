@@ -63,6 +63,10 @@ try:  # package-relative imports
         detect_changes,
     )
     from .step2_change_structure import (
+        PairwisePolynomialFeatures,
+        PairwiseEndpointPolynomialFeatures,
+        build_pairwise_polynomial_features,
+        build_pairwise_endpoint_polynomial_features,
         ChangeStructureResult,
         infer_change_structure,
         infer_change_structure_from_observations,
@@ -85,6 +89,10 @@ except ImportError:  # flat-directory imports
         detect_changes,
     )
     from step2_change_structure import (
+        PairwisePolynomialFeatures,
+        PairwiseEndpointPolynomialFeatures,
+        build_pairwise_polynomial_features,
+        build_pairwise_endpoint_polynomial_features,
         ChangeStructureResult,
         infer_change_structure,
         infer_change_structure_from_observations,
@@ -344,8 +352,8 @@ def run_tides(
     Notes
     -----
     For ``varying_structure``, this wrapper defaults Step 2 to the currently
-    validated ``forward_backward_floor`` sparse search.  It does not use the
-    old Adaptive Group LASSO path unless explicitly requested in
+    validated ``group_bpdn_prefix`` sparse change estimator.  It does not use the
+    legacy Adaptive Group LASSO / forward-backward paths unless explicitly requested in
     ``step2_kwargs``.
     """
 
@@ -399,16 +407,16 @@ def run_tides(
         if change_hypothesis == "varying_structure":
             s2_kwargs.setdefault(
                 "solver_method",
-                "forward_backward_floor",
+                "group_bpdn_prefix",
             )
 
             if (
-                s2_kwargs["solver_method"] == "forward_backward_floor"
+                s2_kwargs["solver_method"] == "group_bpdn_prefix"
                 and profile_floor is None
             ):
                 raise ValueError(
                     "The formal varying_structure Step-2 solver "
-                    "'forward_backward_floor' requires profile_floor."
+                    "'group_bpdn_prefix' requires the uncertainty/profile floor."
                 )
 
         step2 = infer_change_structure_from_observations(
@@ -532,7 +540,11 @@ __all__ = [
     "ChangeDetectionResult",
     "detect_changes",
 
-    # Step 2.
+    # Pairwise preprocessing / Step 2.
+    "PairwisePolynomialFeatures",
+    "PairwiseEndpointPolynomialFeatures",
+    "build_pairwise_polynomial_features",
+    "build_pairwise_endpoint_polynomial_features",
     "ChangeStructureResult",
     "infer_change_structure",
     "infer_change_structure_from_observations",

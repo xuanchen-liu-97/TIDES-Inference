@@ -1227,6 +1227,11 @@ class _DenseResidualBallProjector:
         if self.lambda_bisection_iterations < 20:
             raise ValueError("lambda_bisection_iterations must be >= 20.")
 
+        # First preserve the historical raw-SVD path exactly.  It is the
+        # coefficient-metric-correct factorisation for the Euclidean projection
+        # used by Douglas--Rachford, and remains the default whenever its
+        # numerical column-space test is already compatible with the requested
+        # residual ball.
         U_full, singular_full, Vt_full = np.linalg.svd(
             self.X,
             full_matrices=False,
@@ -1234,45 +1239,122 @@ class _DenseResidualBallProjector:
         self.singular_values_full = singular_full.copy()
 
         if singular_full.size == 0 or singular_full[0] <= 0.0:
-            rank_tol = np.inf
-            keep = np.zeros_like(singular_full, dtype=bool)
+            raw_rank_tol = np.inf
+            raw_keep = np.zeros_like(singular_full, dtype=bool)
         else:
-            rank_tol = float(
+            raw_rank_tol = float(
                 np.finfo(float).eps
                 * max(self.X.shape)
                 * singular_full[0]
             )
-            keep = singular_full > rank_tol
+            raw_keep = singular_full > raw_rank_tol
 
-        self.design_rank = int(np.sum(keep))
-        self.rank_tolerance = float(rank_tol)
-        self.U = U_full[:, keep]
-        self.singular = singular_full[keep]
-        self.Vt = Vt_full[keep, :]
-        self.singular_squared = self.singular * self.singular
-        self.Uty = self.U.T @ self.y
+        raw_U = U_full[:, raw_keep]
+        raw_singular = singular_full[raw_keep]
+        raw_Vt = Vt_full[raw_keep, :]
+        raw_Uty = raw_U.T @ self.y
+        raw_y_perp = self.y - raw_U @ raw_Uty
+        raw_irreducible = float(np.linalg.norm(raw_y_perp))
 
-        # Directions below the standard numerical-rank threshold are treated as
-        # unresolved rather than exploited through enormous coefficients.  Their
-        # target component therefore belongs to the irreducible residual.
-        y_perp = self.y - self.U @ self.Uty
-        self.irreducible_residual_norm = float(np.linalg.norm(y_perp))
-        self.irreducible_residual_squared = float(y_perp @ y_perp)
-
-        # Numerical feasibility of the residual ball.  The small tolerance only
-        # protects against round-off in the orthogonal projection of y.
         feasibility_slack = 100.0 * np.finfo(float).eps * max(
             float(np.linalg.norm(self.y)),
             self.radius,
             1.0,
         )
-        if self.irreducible_residual_norm > self.radius + feasibility_slack:
-            raise ValueError(
-                "The requested residual ball does not intersect the design "
-                "column space: irreducible residual "
-                f"{self.irreducible_residual_norm:.3e} exceeds radius "
-                f"{self.radius:.3e}."
+
+        # Usually the raw factorisation is sufficient.  Keeping this branch
+        # means the established dense/reference solver is unchanged on problems
+        # whose raw numerical rank already gives a feasible residual ball.
+        if raw_irreducible <= self.radius + feasibility_slack:
+            self.design_rank = int(np.sum(raw_keep))
+            self.rank_tolerance = float(raw_rank_tol)
+            self.U = raw_U
+            self.singular = raw_singular
+            self.Vt = raw_Vt
+            self.rank_backend = "raw-svd"
+        else:
+            # A raw SVD rank test is not invariant to harmless rescaling of the
+            # design columns.  In coherent restricted working sets, columns can
+            # differ greatly in norm, so the standard raw threshold may discard
+            # weak but genuinely resolved directions and falsely declare the
+            # residual ball empty.  Audit the column space after equilibration.
+            column_scale = np.linalg.norm(self.X, axis=0)
+            good = column_scale > 1.0e-14
+
+            if not np.any(good):
+                raise ValueError(
+                    "The requested residual ball does not intersect the design "
+                    "column space: the design has no numerically nonzero columns."
+                )
+
+            X_equilibrated = (
+                self.X[:, good] / column_scale[good][None, :]
             )
+            U_eq, singular_eq, _ = np.linalg.svd(
+                X_equilibrated,
+                full_matrices=False,
+            )
+            if singular_eq.size == 0 or singular_eq[0] <= 0.0:
+                eq_rank_tol = np.inf
+                eq_rank = 0
+            else:
+                eq_rank_tol = float(
+                    np.finfo(float).eps
+                    * max(X_equilibrated.shape)
+                    * singular_eq[0]
+                )
+                eq_rank = int(np.sum(singular_eq > eq_rank_tol))
+
+            Q = U_eq[:, :eq_rank]
+            y_col = Q @ (Q.T @ self.y) if eq_rank else np.zeros_like(self.y)
+            eq_y_perp = self.y - y_col
+            eq_irreducible = float(np.linalg.norm(eq_y_perp))
+
+            if eq_irreducible > self.radius + feasibility_slack:
+                raise ValueError(
+                    "The requested residual ball does not intersect the design "
+                    "column space: irreducible residual "
+                    f"{eq_irreducible:.3e} exceeds radius {self.radius:.3e}. "
+                    f"(raw-SVD audit gave {raw_irreducible:.3e})"
+                )
+
+            # Q robustly identifies col(X), but directly solving the BPDN
+            # projection in equilibrated coefficient coordinates would change
+            # the Euclidean coefficient metric.  Instead reduce the RAW design
+            # to this certified column space and SVD the reduced operator:
+            #
+            #     B = Q^T X.
+            #
+            # Its right singular vectors and singular values therefore define
+            # exactly the same raw-coefficient Euclidean projection, while Q
+            # prevents the rank decision from depending on column magnitudes.
+            B = Q.T @ self.X
+            U_red, singular_red, Vt_red = np.linalg.svd(
+                B,
+                full_matrices=False,
+            )
+            if eq_rank and (
+                singular_red.size < eq_rank
+                or singular_red[eq_rank - 1] <= 0.0
+            ):
+                raise RuntimeError(
+                    "Column-equilibrated rank audit found a direction that the "
+                    "reduced raw design could not resolve numerically."
+                )
+
+            self.design_rank = int(eq_rank)
+            self.rank_tolerance = float(eq_rank_tol)
+            self.U = Q @ U_red[:, :eq_rank]
+            self.singular = singular_red[:eq_rank]
+            self.Vt = Vt_red[:eq_rank, :]
+            self.rank_backend = "equilibrated-span/raw-metric-svd"
+
+        self.singular_squared = self.singular * self.singular
+        self.Uty = self.U.T @ self.y
+
+        y_perp = self.y - self.U @ self.Uty
+        self.irreducible_residual_norm = float(np.linalg.norm(y_perp))
+        self.irreducible_residual_squared = float(y_perp @ y_perp)
 
     def _project_with_multiplier(self, beta: Array) -> Tuple[Array, float]:
         """Project onto the residual ball and return its squared-norm KKT multiplier.
@@ -1390,7 +1472,7 @@ def _default_douglas_rachford_step(
         float(largest_singular_value),
         np.finfo(float).tiny,
     )
-    return max(1.0e-3 * coefficient_scale, np.finfo(float).eps)
+    return max(1.0e-1 * coefficient_scale, np.finfo(float).eps)
 
 
 def solve_group_basis_pursuit_denoising(
@@ -1618,7 +1700,7 @@ def solve_group_basis_pursuit_denoising(
             for label in group_order
         ]
         max_dual_ratio = max(feasible_ratios, default=0.0)
-        dual_feasible = bool(max_dual_ratio <= 1.0 + 100.0 * np.finfo(float).eps)
+        dual_feasible = bool(max_dual_ratio <= 1.0 + 1.0e-10)
         if dual_feasible:
             dual_objective = float(
                 y @ dual_vector - radius * np.linalg.norm(dual_vector)

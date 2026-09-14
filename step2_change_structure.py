@@ -24,13 +24,31 @@ Two computational backends implement the same Step-2 statistical principle.
     Memory-scalable backend.  It never materialises the full cumulative change
     matrix.  The stationary anchor is stored sparsely, projected with high-
     accuracy LSQR, and projected temporal group blocks are generated lazily.
-    Conditional feasibility screening supplies a small working set to the same
-    dense-SVD BPDN reference solver.  Final support size is still chosen only by
-    the independent ranked-prefix uncertainty-floor certificate.
+    The default scalable solver builds a floor-feasible working set in batches,
+    solves restricted grouped BPDN with the dense-SVD reference kernel, and then
+    globally audits every omitted group with the BPDN dual/KKT conditions.
+    Violating groups are reactivated until the full convex problem is certified.
+    Final support size is still chosen only by the independent ranked-prefix
+    uncertainty-floor certificate.  The older conditional-screening backend is
+    retained as an explicit regression baseline.
 
-The scalable screen is an acceleration/ranking backend, not a claim that tiny
-full-BPDN leakage coefficients outside the working set are exactly zero.  The
-formal Step-2 output remains the floor-certified support.
+General pairwise input/output representation
+--------------------------------------------
+The inference core accepts either the historical scalar/mode-resolved edge
+features ``(T,M,L)`` or generalized endpoint-output features ``(T,M,L,2)``.
+The latter gather the complete sender/receiver state and directly specify the
+two endpoint contributions of each basis function, so no equal-and-opposite
+``D q`` output assumption is required.
+
+``build_pairwise_polynomial_features`` retains the orthonormal common/difference
+coordinate construction for scalar/mode-resolved experiments.  The preferred
+fully generalized builder, ``build_pairwise_endpoint_polynomial_features``,
+uses sender/receiver states and a swap-equivariant polynomial basis.  To avoid
+a structural edge-self gauge, own-state-only monomials are assigned to the
+one-body sector; the returned pairwise library contains all cross-only and
+genuine joint monomials up to the requested degree.  Thus topology, pairwise
+state gathering, and unknown local dynamics remain separated without making
+individual edge coefficients non-identifiable by construction.
 
 Noise awareness
 ---------------
@@ -60,10 +78,12 @@ try:  # package form
         ForwardBackwardGroupSearchResult,
         GroupBasisPursuitResult,
         ScreenedGroupBasisPursuitResult,
+        WorkingSetGroupBasisPursuitResult,
         solve_adaptive_group_lasso,
         solve_forward_backward_group_search,
         solve_group_basis_pursuit_denoising,
         solve_screened_group_basis_pursuit_denoising,
+        solve_working_set_group_basis_pursuit_denoising,
     )
     from .solvers_linear_regression import (
         LinearRegressionResult,
@@ -75,10 +95,12 @@ except ImportError:  # flat-file form
         ForwardBackwardGroupSearchResult,
         GroupBasisPursuitResult,
         ScreenedGroupBasisPursuitResult,
+        WorkingSetGroupBasisPursuitResult,
         solve_adaptive_group_lasso,
         solve_forward_backward_group_search,
         solve_group_basis_pursuit_denoising,
         solve_screened_group_basis_pursuit_denoising,
+        solve_working_set_group_basis_pursuit_denoising,
     )
     from solvers_linear_regression import (
         LinearRegressionResult,
@@ -89,6 +111,393 @@ except ImportError:  # flat-file form
 FloatArray = NDArray[np.float64]
 IntArray = NDArray[np.int64]
 GroupLabel = tuple[int, int]  # (transition ordinal, candidate-edge index)
+
+
+@dataclass(frozen=True)
+class PairwisePolynomialFeatures:
+    """Dynamics-agnostic pairwise local-state polynomial features.
+
+    For the oriented incidence convention ``D[:,m] = -e_i + e_j`` we first
+    gather the complete endpoint state in the orthonormal common/difference
+    coordinates
+
+        c_m = (x_i + x_j) / sqrt(2),
+        d_m = (x_j - x_i) / sqrt(2).
+
+    This is an invertible orthogonal change of coordinates from ``(x_i,x_j)``.
+    For an undirected interaction, reversing the arbitrary bookkeeping
+    orientation leaves ``c`` unchanged and sends ``d -> -d``.  Orientation-
+    equivariant endpoint dynamics therefore decompose into a common output
+    channel that is even in ``d`` and a difference output channel that is odd
+    in ``d``.  ``output_modes`` records that topological assembly channel for
+    every polynomial feature without doubling the feature dimension.
+    """
+
+    local_states: FloatArray              # (T, M, 2), orthonormal physical (c,d)
+    normalized_local_states: FloatArray   # (T, M, 2), coordinates used by basis
+    edge_features: FloatArray             # (T, M, L)
+    exponents: tuple[tuple[int, int], ...] # (power of c, power of d)
+    feature_labels: tuple[str, ...]
+    output_modes: tuple[str, ...]          # 'common' for even d, 'difference' for odd d
+    component_labels: tuple[str, ...]      # mode-resolved labels for Step 4
+    coordinate_scale: FloatArray           # shape (2,), scale-only normalization
+    degree: int
+    include_constant: bool
+    normalization: str
+    coordinate_convention: str
+
+
+def _validate_standard_pairwise_incidence(D: FloatArray) -> None:
+    """Require one ``-1`` tail and one ``+1`` head per candidate pair."""
+
+    D_arr = np.asarray(D, dtype=float)
+    nz = np.abs(D_arr) > 1.0e-12
+    if D_arr.ndim != 2 or not np.all(np.sum(nz, axis=0) == 2):
+        raise ValueError(
+            "General pairwise common/difference coordinates require exactly two "
+            "nonzero incidence entries per candidate edge."
+        )
+    for m in range(D_arr.shape[1]):
+        vals = np.sort(D_arr[nz[:, m], m])
+        if not np.allclose(vals, np.array([-1.0, 1.0]), atol=1.0e-12, rtol=0.0):
+            raise ValueError(
+                "General pairwise common/difference coordinates require standard "
+                "oriented incidence columns with values {-1,+1}; interaction "
+                "strengths belong in inferred coefficients, not in D."
+            )
+
+
+def _resolve_feature_output_modes(
+    n_features: int,
+    feature_output_modes: Optional[Sequence[str]],
+) -> tuple[str, ...]:
+    """Resolve feature-wise node-space assembly directions.
+
+    ``None`` preserves the historical TIDES convention exactly: every feature
+    uses the unnormalised incidence direction ``D[:,m]``.  Explicit
+    ``'common'`` / ``'difference'`` modes use the orthonormal endpoint-output
+    basis ``|D|/sqrt(2)`` / ``D/sqrt(2)``.
+    """
+
+    L = int(n_features)
+    if feature_output_modes is None:
+        return tuple("legacy_difference" for _ in range(L))
+    modes = tuple(str(x).lower() for x in feature_output_modes)
+    if len(modes) != L:
+        raise ValueError(
+            "feature_output_modes must contain exactly one entry per edge feature."
+        )
+    bad = sorted(set(modes) - {"common", "difference", "legacy_difference"})
+    if bad:
+        raise ValueError(
+            "feature_output_modes entries must be 'common' or 'difference' "
+            f"(legacy internal mode also accepted); got invalid values {bad!r}."
+        )
+    return modes
+
+
+def _feature_output_directions(
+    D: FloatArray,
+    modes: Sequence[str],
+) -> FloatArray:
+    """Return node-space output directions with shape ``(N,M,L)``."""
+
+    D_arr = np.asarray(D, dtype=float)
+    modes = tuple(modes)
+    if any(mode != "legacy_difference" for mode in modes):
+        _validate_standard_pairwise_incidence(D_arr)
+    inv_sqrt2 = 1.0 / np.sqrt(2.0)
+    out = np.empty((D_arr.shape[0], D_arr.shape[1], len(modes)), dtype=float)
+    for ell, mode in enumerate(modes):
+        if mode == "legacy_difference":
+            out[:, :, ell] = D_arr
+        elif mode == "difference":
+            out[:, :, ell] = inv_sqrt2 * D_arr
+        elif mode == "common":
+            out[:, :, ell] = inv_sqrt2 * np.abs(D_arr)
+        else:  # defensive: modes are validated above
+            raise RuntimeError(f"Unknown output mode {mode!r}.")
+    return out
+
+
+def build_pairwise_polynomial_features(
+    node_states: ArrayLike,
+    D: ArrayLike,
+    *,
+    degree: int = 2,
+    include_constant: bool = False,
+    normalization: Literal["none", "rms", "maxabs"] = "rms",
+    coordinate_scale: Optional[Sequence[float]] = None,
+) -> PairwisePolynomialFeatures:
+    """Construct the orientation-equivariant generic pairwise feature library.
+
+    No target dynamical law is supplied.  Each standard incidence edge first
+    receives the complete endpoint state through the orthonormal coordinates
+
+        c_m = (x_i + x_j) / sqrt(2),
+        d_m = (x_j - x_i) / sqrt(2).
+
+    We then evaluate every monomial ``c**a * d**b`` up to the requested total
+    degree.  Orientation equivariance fixes only the *output assembly channel*:
+    even powers of ``d`` contribute through the common endpoint direction
+    ``|D|/sqrt(2)``, while odd powers contribute through the difference direction
+    ``D/sqrt(2)``.  This is a topological symmetry constraint, not information
+    about the unknown target law.
+
+    ``normalization`` rescales ``c`` and ``d`` but does not centre them, so parity
+    under edge reversal and the physical zero-relative-state origin are preserved.
+    """
+
+    X = np.asarray(node_states, dtype=float)
+    D_arr = np.asarray(D, dtype=float)
+    if X.ndim != 2:
+        raise ValueError("node_states must have shape (n_observations, n_nodes).")
+    if D_arr.ndim != 2:
+        raise ValueError("D must have shape (n_nodes, n_candidate_edges).")
+    if X.shape[1] != D_arr.shape[0]:
+        raise ValueError("node_states.shape[1] must equal D.shape[0].")
+    if X.shape[0] == 0 or X.shape[1] == 0 or D_arr.shape[1] == 0:
+        raise ValueError("node_states and D must be non-empty.")
+    if not np.all(np.isfinite(X)) or not np.all(np.isfinite(D_arr)):
+        raise ValueError("node_states and D must be finite.")
+
+    degree = int(degree)
+    if degree < 1:
+        raise ValueError("degree must be >= 1.")
+
+    _validate_standard_pairwise_incidence(D_arr)
+
+    inv_sqrt2 = 1.0 / np.sqrt(2.0)
+    d = inv_sqrt2 * (X @ D_arr)
+    c = inv_sqrt2 * (X @ np.abs(D_arr))
+    local = np.stack([c, d], axis=2)
+
+    normalization = str(normalization).lower()
+    if normalization not in {"none", "rms", "maxabs"}:
+        raise ValueError("normalization must be 'none', 'rms', or 'maxabs'.")
+
+    if coordinate_scale is not None:
+        scale = np.asarray(coordinate_scale, dtype=float).reshape(-1)
+        if scale.shape != (2,) or not np.all(np.isfinite(scale)) or np.any(scale <= 0):
+            raise ValueError("coordinate_scale must contain two finite positive values.")
+    elif normalization == "none":
+        scale = np.ones(2, dtype=float)
+    elif normalization == "rms":
+        scale = np.sqrt(np.mean(local * local, axis=(0, 1)))
+        scale = np.where(scale > 1.0e-14, scale, 1.0)
+    else:
+        scale = np.max(np.abs(local), axis=(0, 1))
+        scale = np.where(scale > 1.0e-14, scale, 1.0)
+
+    local_scaled = local / scale[None, None, :]
+    cs = local_scaled[:, :, 0]
+    ds = local_scaled[:, :, 1]
+
+    exponents: list[tuple[int, int]] = []
+    start_degree = 0 if include_constant else 1
+    for total in range(start_degree, degree + 1):
+        for a in range(total, -1, -1):
+            b = total - a
+            exponents.append((int(a), int(b)))
+
+    features = np.empty((X.shape[0], D_arr.shape[1], len(exponents)), dtype=float)
+    labels: list[str] = []
+    modes: list[str] = []
+    component_labels: list[str] = []
+    for ell, (a, b) in enumerate(exponents):
+        term = np.ones_like(cs)
+        if a:
+            term = term * np.power(cs, a)
+        if b:
+            term = term * np.power(ds, b)
+        features[:, :, ell] = term
+        if a == 0 and b == 0:
+            label = "1"
+        else:
+            parts = []
+            if a:
+                parts.append("c" if a == 1 else f"c^{a}")
+            if b:
+                parts.append("d" if b == 1 else f"d^{b}")
+            label = "*".join(parts)
+        mode = "common" if (b % 2 == 0) else "difference"
+        labels.append(label)
+        modes.append(mode)
+        component_labels.append(f"{mode}:{label}")
+
+    return PairwisePolynomialFeatures(
+        local_states=np.asarray(local, dtype=float),
+        normalized_local_states=np.asarray(local_scaled, dtype=float),
+        edge_features=np.asarray(features, dtype=float),
+        exponents=tuple(exponents),
+        feature_labels=tuple(labels),
+        output_modes=tuple(modes),
+        component_labels=tuple(component_labels),
+        coordinate_scale=np.asarray(scale, dtype=float),
+        degree=int(degree),
+        include_constant=bool(include_constant),
+        normalization=str(normalization),
+        coordinate_convention="orthonormal-common-difference",
+    )
+
+
+@dataclass(frozen=True)
+class PairwiseEndpointPolynomialFeatures:
+    """Gauge-fixed, orientation-equivariant pairwise endpoint library.
+
+    A general swap-equivariant endpoint law can be written as
+
+        g_i = F(x_i, x_j),
+        g_j = F(x_j, x_i).
+
+    Monomials depending only on the *receiving node itself* (``x_i**n`` in
+    ``g_i`` and ``x_j**n`` in ``g_j``) form a one-body sector and cannot be
+    uniquely assigned to individual incident edges without extra microscopic
+    assumptions.  This builder therefore returns the canonical pairwise sector
+    modulo that one-body gauge: for every total degree ``n`` it keeps
+
+        x_i**a x_j**b  in g_i,
+        x_j**a x_i**b  in g_j,
+
+    with ``a+b=n`` and ``b>=1``.  Cross-only terms (``a=0``) and genuine joint
+    terms (``a,b>0``) are both retained.  The omitted own-only sector should be
+    modelled separately as node-local dynamics when required.
+    """
+
+    local_states: FloatArray          # (T,M,2), orthonormal (c,d)
+    endpoint_states: FloatArray       # (T,M,2), oriented (tail,head)
+    normalized_endpoint_states: FloatArray
+    endpoint_features: FloatArray     # (T,M,L,2): contributions at (tail,head)
+    powers: tuple[tuple[int, int], ...]  # (self power a, neighbour power b>=1)
+    feature_labels: tuple[str, ...]
+    component_labels: tuple[str, ...]
+    state_scale: float
+    degree: int
+    normalization: str
+    feature_representation: str
+
+
+def _pair_endpoints_from_incidence(D: FloatArray) -> tuple[IntArray, IntArray]:
+    """Return tail/head node indices from standard oriented incidence columns."""
+
+    D_arr = np.asarray(D, dtype=float)
+    _validate_standard_pairwise_incidence(D_arr)
+    M = D_arr.shape[1]
+    tail = np.empty(M, dtype=np.int64)
+    head = np.empty(M, dtype=np.int64)
+    for m in range(M):
+        tail[m] = int(np.flatnonzero(D_arr[:, m] < -0.5)[0])
+        head[m] = int(np.flatnonzero(D_arr[:, m] > 0.5)[0])
+    return tail, head
+
+
+def build_pairwise_endpoint_polynomial_features(
+    node_states: ArrayLike,
+    D: ArrayLike,
+    *,
+    degree: int = 2,
+    normalization: Literal["none", "rms", "maxabs"] = "rms",
+    state_scale: Optional[float] = None,
+) -> PairwiseEndpointPolynomialFeatures:
+    """Build a dynamics-agnostic identifiable pairwise endpoint library.
+
+    The incidence matrix is used only to gather the two endpoint states.  The
+    complete endpoint information is retained; no assumption such as
+    ``G=G(x_j-x_i)`` is made.  A common scalar scale is used for both endpoints,
+    preserving swap equivariance.  The returned feature tensor already contains
+    the two endpoint output values and can therefore represent non-conservative
+    interactions such as SIS/LV-like pairwise terms without a fixed ``D q``
+    assembly rule.
+
+    The library is complete for polynomial swap-equivariant *pairwise* dynamics
+    up to ``degree`` after quotienting out the node-local own-state sector.  The
+    latter is a separate one-body component rather than an identifiable edge
+    contribution.
+    """
+
+    X = np.asarray(node_states, dtype=float)
+    D_arr = np.asarray(D, dtype=float)
+    if X.ndim != 2:
+        raise ValueError("node_states must have shape (n_observations, n_nodes).")
+    if D_arr.ndim != 2 or X.shape[1] != D_arr.shape[0]:
+        raise ValueError("D must have shape (n_nodes, n_candidate_edges).")
+    if not np.all(np.isfinite(X)) or not np.all(np.isfinite(D_arr)):
+        raise ValueError("node_states and D must be finite.")
+    degree = int(degree)
+    if degree < 1:
+        raise ValueError("degree must be >= 1.")
+
+    tail, head = _pair_endpoints_from_incidence(D_arr)
+    xs = X[:, tail]
+    xr = X[:, head]
+    endpoint = np.stack([xs, xr], axis=2)
+    inv_sqrt2 = 1.0 / np.sqrt(2.0)
+    c = inv_sqrt2 * (xs + xr)
+    d = inv_sqrt2 * (xr - xs)
+    local = np.stack([c, d], axis=2)
+
+    normalization = str(normalization).lower()
+    if normalization not in {"none", "rms", "maxabs"}:
+        raise ValueError("normalization must be 'none', 'rms', or 'maxabs'.")
+    if state_scale is not None:
+        scale = float(state_scale)
+        if not np.isfinite(scale) or scale <= 0.0:
+            raise ValueError("state_scale must be finite and positive.")
+    elif normalization == "none":
+        scale = 1.0
+    elif normalization == "rms":
+        scale = float(np.sqrt(np.mean(X * X)))
+        if scale <= 1.0e-14:
+            scale = 1.0
+    else:
+        scale = float(np.max(np.abs(X)))
+        if scale <= 1.0e-14:
+            scale = 1.0
+
+    xsn = xs / scale
+    xrn = xr / scale
+    endpoint_scaled = np.stack([xsn, xrn], axis=2)
+
+    powers: list[tuple[int, int]] = []
+    labels: list[str] = []
+    for total in range(1, degree + 1):
+        for a in range(0, total):
+            b = total - a  # neighbour power; always >= 1
+            powers.append((int(a), int(b)))
+            if a == 0:
+                label = "neighbor" if b == 1 else f"neighbor^{b}"
+            else:
+                left = "self" if a == 1 else f"self^{a}"
+                right = "neighbor" if b == 1 else f"neighbor^{b}"
+                label = f"{left}*{right}"
+            labels.append(label)
+
+    E = np.empty((X.shape[0], D_arr.shape[1], len(powers), 2), dtype=float)
+    for ell, (a, b) in enumerate(powers):
+        tail_term = np.ones_like(xsn)
+        head_term = np.ones_like(xrn)
+        if a:
+            tail_term *= np.power(xsn, a)
+            head_term *= np.power(xrn, a)
+        if b:
+            tail_term *= np.power(xrn, b)
+            head_term *= np.power(xsn, b)
+        E[:, :, ell, 0] = tail_term
+        E[:, :, ell, 1] = head_term
+
+    return PairwiseEndpointPolynomialFeatures(
+        local_states=np.asarray(local, dtype=float),
+        endpoint_states=np.asarray(endpoint, dtype=float),
+        normalized_endpoint_states=np.asarray(endpoint_scaled, dtype=float),
+        endpoint_features=np.asarray(E, dtype=float),
+        powers=tuple(powers),
+        feature_labels=tuple(labels),
+        component_labels=tuple(f"pair:{label}" for label in labels),
+        state_scale=float(scale),
+        degree=int(degree),
+        normalization=str(normalization),
+        feature_representation="endpoint_pairwise_irreducible",
+    )
 
 
 @dataclass(frozen=True)
@@ -110,6 +519,8 @@ class CumulativeChangeDesign:
     n_nodes: int
     n_edges: int
     n_edge_features: int
+    feature_output_modes: tuple[str, ...]
+    feature_representation: str
     n_transitions: int
 
 
@@ -120,7 +531,7 @@ class ScalableCumulativeChangeDesign:
     """Lazy projected cumulative Step-2 design.
 
     The full ``X_change`` / ``X_change_perp`` arrays do not exist.  Projected
-    group blocks are materialised only when requested by the screened solver or
+    group blocks are materialised only when requested by a scalable solver or
     the final prefix certificate.
     """
 
@@ -136,6 +547,8 @@ class ScalableCumulativeChangeDesign:
     n_nodes: int
     n_edges: int
     n_edge_features: int
+    feature_output_modes: tuple[str, ...]
+    feature_representation: str
     n_transitions: int
     n_base_columns: int
     anchor_nnz: int
@@ -154,16 +567,40 @@ class ScalableCumulativeChangeDesign:
     ) -> tuple[GroupLabel, float]:
         return self._operator.conditional_gain_provider(residual, Q, omitted)
 
+    def group_adjoint_norm_provider(
+        self,
+        vector: FloatArray,
+        labels: tuple[GroupLabel, ...],
+    ) -> Mapping[GroupLabel, float]:
+        return self._operator.group_adjoint_norm_provider(vector, labels)
+
 
 class _SparseBaselineProjector:
-    """Sparse high-accuracy projector onto the complement of the anchor span.
+    """Project onto the orthogonal complement of the stationary-anchor span.
 
-    The anchor itself is sparse for edge-incidence models: one edge-function
-    column touches only the nodes on that candidate edge.  Projection vectors
-    and the small number of selected group columns are computed by LSQR.  A
-    sparse factorisation of the scaled normal Gram is retained *only* for the
-    conditional-screening self-Gram calculation; it is not used for the final
-    projected data/columns.
+    The scalable Step-2 path must preserve the *same profiled geometry* as the
+    dense reference.  A small projection error can otherwise be interpreted as
+    temporal signal when the uncertainty floor is very tight.
+
+    Strategy
+    --------
+    1. If the scaled sparse anchor is small enough to densify, cache the same
+       machine-rank SVD column-space basis used by the dense reference and apply
+
+           P_perp b = b - Q (Q^T b).
+
+       This is the preferred path for small/moderate anchors because it gives an
+       explicitly orthogonal projector.
+
+    2. Otherwise use sparse LSQR with a generous iteration budget.  The returned
+       residual is *certified* by its maximum cosine with the unit-norm scaled
+       anchor columns.  If needed, one or more correction solves remove the
+       remaining anchor component.  Failure to meet the certificate raises an
+       error rather than silently contaminating Step 2.
+
+    The optional normal-Gram LU is retained only for the legacy conditional-
+    screening self-Gram calculation; the KKT working-set backend does not need
+    it for projection.
     """
 
     def __init__(
@@ -173,6 +610,9 @@ class _SparseBaselineProjector:
         projection_tol: float = 1.0e-16,
         projection_max_iter: Optional[int] = None,
         diagnostic_dense_bytes: int = 64 * 1024**2,
+        projection_certificate_tol: float = 1.0e-12,
+        projection_refinement_passes: int = 2,
+        require_projected_gram: bool = True,
     ):
         X_base = sp.csc_matrix(X_base, dtype=float)
         self.n_rows, self.n_columns_original = X_base.shape
@@ -180,11 +620,34 @@ class _SparseBaselineProjector:
         if not np.isfinite(self.projection_tol) or self.projection_tol <= 0.0:
             raise ValueError("projection_tol must be finite and positive.")
 
+        self.projection_certificate_tol = float(projection_certificate_tol)
+        if (
+            not np.isfinite(self.projection_certificate_tol)
+            or self.projection_certificate_tol <= 0.0
+        ):
+            raise ValueError(
+                "projection_certificate_tol must be finite and positive."
+            )
+
+        self.projection_refinement_passes = int(projection_refinement_passes)
+        if self.projection_refinement_passes < 0:
+            raise ValueError("projection_refinement_passes must be >= 0.")
+
+        # Runtime diagnostics.  These are intentionally monotone so the caller
+        # can inspect the worst projection encountered during one Step-2 solve.
+        self.projection_solve_count = 0
+        self.projection_refinement_count = 0
+        self.max_projection_certificate = 0.0
+        self.max_lsqr_iterations = 0
+        self.last_lsqr_istop = 0
+
         norms = np.sqrt(np.asarray(X_base.power(2).sum(axis=0)).reshape(-1))
         good = norms > 1.0e-14
         self.good_columns = np.flatnonzero(good)
         self.zero_columns = np.flatnonzero(~good)
         self.column_scale = norms[good]
+
+        self._orthogonal_basis: Optional[FloatArray] = None
 
         if self.good_columns.size == 0:
             self.X_scaled = sp.csc_matrix((self.n_rows, 0), dtype=float)
@@ -194,6 +657,7 @@ class _SparseBaselineProjector:
             self.rank_tolerance = 0.0
             self.weakest_relative_singular = np.nan
             self.max_iter = 0
+            self.projection_backend = "empty-anchor"
             return
 
         X_good = X_base[:, self.good_columns]
@@ -201,72 +665,136 @@ class _SparseBaselineProjector:
             X_good @ sp.diags(1.0 / self.column_scale, format="csc")
         ).tocsc()
         p = self.X_scaled.shape[1]
+
+        # The previous default max(2000, 4*p) was not a convergence guarantee:
+        # a well-defined N=8 endpoint benchmark required ~3700 iterations even
+        # though p=84.  Give LSQR a true ceiling and let its own stopping rule
+        # terminate early when the problem is easy.
         if projection_max_iter is None:
-            self.max_iter = int(max(2000, min(20000, 4 * p)))
+            self.max_iter = 20000
         else:
             self.max_iter = int(projection_max_iter)
             if self.max_iter < 1:
                 raise ValueError("projection_max_iter must be >= 1.")
 
-        # Screening repeatedly needs A_g^T P_perp A_g.  The sparse scaled Gram
-        # is factorised once.  A singular Gram means the baseline representation
-        # itself contains redundant nonzero columns; for now the scalable path
-        # asks the caller to use the dense reference or remove that redundancy.
-        gram = (self.X_scaled.T @ self.X_scaled).tocsc()
-        try:
-            self.gram_lu = splu(gram)
-        except RuntimeError as exc:
-            raise RuntimeError(
-                "Scalable Step 2 requires the nonzero stationary-anchor columns "
-                "to be numerically independent for its sparse screening "
-                "factorisation. The dense backend can still handle a rank-"
-                "deficient anchor."
-            ) from exc
-
         dense_bytes = int(self.X_scaled.shape[0] * p * 8)
         if dense_bytes <= int(diagnostic_dense_bytes):
             A_dense = self.X_scaled.toarray()
-            singular = np.linalg.svd(A_dense, compute_uv=False)
-            if singular.size and singular[0] > 0.0:
-                rank_tol = float(
-                    np.finfo(float).eps * max(A_dense.shape) * singular[0]
-                )
-                rank = int(np.sum(singular > rank_tol))
-                weakest = (
-                    float(singular[rank - 1] / singular[0])
-                    if rank > 0
-                    else np.nan
-                )
-            else:
-                rank_tol = 0.0
-                rank = 0
-                weakest = np.nan
-            self.rank = rank
+            Q, rank, singular, rank_tol, weakest = _scaled_column_space_basis(
+                A_dense,
+                zero_column_tol=1.0e-14,
+            )
+            self._orthogonal_basis = np.asarray(Q, dtype=float)
+            self.rank = int(rank)
             self.singular_values = np.asarray(singular, dtype=float)
-            self.rank_tolerance = rank_tol
-            self.weakest_relative_singular = weakest
+            self.rank_tolerance = float(rank_tol)
+            self.weakest_relative_singular = float(weakest)
+            self.projection_backend = "dense-svd-anchor-orthogonal"
         else:
-            # Successful sparse LU of X_s^T X_s certifies full column rank in
-            # the arithmetic used by the scalable screening backend.  We avoid
-            # an expensive dense SVD solely for diagnostics at large scale.
-            self.rank = int(p)
+            # Large-anchor path: remain sparse/matrix-free for projection.
+            # Rank is not inferred from LSQR.  The optional projected-Gram LU
+            # below can certify full column rank for the legacy screen only.
+            self.rank = -1
             self.singular_values = np.empty(0, dtype=float)
             self.rank_tolerance = np.nan
             self.weakest_relative_singular = np.nan
+            self.projection_backend = "sparse-lsqr-certified"
 
-    def _lsqr_projection_coefficients(self, b: FloatArray) -> FloatArray:
-        if self.X_scaled.shape[1] == 0:
-            return np.empty(0, dtype=float)
+        # Only the legacy conditional-gain screen needs A_g^T P_perp A_g.
+        self.gram_lu = None
+        if bool(require_projected_gram):
+            gram = (self.X_scaled.T @ self.X_scaled).tocsc()
+            try:
+                self.gram_lu = splu(gram)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "Legacy screened scalable Step 2 requires the nonzero "
+                    "stationary-anchor columns to be numerically independent "
+                    "for its projected-Gram factorisation. Use "
+                    "scalable_solver='working_set' to avoid this requirement."
+                ) from exc
+            if self.rank < 0:
+                self.rank = int(p)
+
+    def _projection_certificate(self, residual: FloatArray) -> float:
+        """Maximum cosine with any scaled anchor column.
+
+        ``X_scaled`` has unit-norm columns, so
+
+            max_j |x_j^T r| / ||r||
+
+        is exactly the maximum absolute anchor-column cosine.  A true orthogonal
+        projection has value zero up to roundoff.
+        """
+
+        r = np.asarray(residual, dtype=float).reshape(-1)
+        r_norm = float(np.linalg.norm(r))
+        if r_norm <= np.finfo(float).tiny or self.X_scaled.shape[1] == 0:
+            return 0.0
+        normal = np.asarray(self.X_scaled.T @ r).reshape(-1)
+        if normal.size == 0:
+            return 0.0
+        return float(np.max(np.abs(normal)) / r_norm)
+
+    def _lsqr_once(
+        self,
+        rhs: FloatArray,
+        *,
+        btol: Optional[float] = None,
+    ) -> tuple[FloatArray, tuple]:
+        rhs = np.asarray(rhs, dtype=float).reshape(-1)
         out = lsqr(
             self.X_scaled,
-            np.asarray(b, dtype=float).reshape(-1),
+            rhs,
             atol=self.projection_tol,
-            btol=self.projection_tol,
+            btol=self.projection_tol if btol is None else float(btol),
             conlim=1.0e18,
             iter_lim=self.max_iter,
             show=False,
         )
-        return np.asarray(out[0], dtype=float)
+        self.max_lsqr_iterations = max(self.max_lsqr_iterations, int(out[2]))
+        self.last_lsqr_istop = int(out[1])
+        return np.asarray(out[0], dtype=float), out
+
+    def _project_vector_sparse_certified(self, b: FloatArray) -> FloatArray:
+        b = np.asarray(b, dtype=float).reshape(-1)
+
+        coef, _ = self._lsqr_once(b)
+        residual = b - np.asarray(self.X_scaled @ coef).reshape(-1)
+        certificate = self._projection_certificate(residual)
+
+        # A second least-squares solve on the *remaining anchor component* is
+        # effective only after the first solve has actually converged.  This is
+        # different from the earlier diagnostic that repeatedly restarted an
+        # under-converged 2000-iteration solve.
+        for _ in range(self.projection_refinement_passes):
+            if certificate <= self.projection_certificate_tol:
+                break
+            correction, _ = self._lsqr_once(residual, btol=0.0)
+            residual = residual - np.asarray(
+                self.X_scaled @ correction
+            ).reshape(-1)
+            self.projection_refinement_count += 1
+            certificate = self._projection_certificate(residual)
+
+        self.projection_solve_count += 1
+        self.max_projection_certificate = max(
+            self.max_projection_certificate,
+            float(certificate),
+        )
+
+        if certificate > self.projection_certificate_tol:
+            raise RuntimeError(
+                "Scalable stationary-anchor projection failed its numerical "
+                "orthogonality certificate: max anchor cosine="
+                f"{certificate:.3e} exceeds tolerance "
+                f"{self.projection_certificate_tol:.3e}. Increase "
+                "scalable_projection_max_iter, relax the externally calibrated "
+                "uncertainty floor if scientifically justified, or use the "
+                "dense backend for this problem."
+            )
+
+        return np.asarray(residual, dtype=float)
 
     def project_vector(self, b: FloatArray) -> FloatArray:
         b = np.asarray(b, dtype=float).reshape(-1)
@@ -274,8 +802,19 @@ class _SparseBaselineProjector:
             raise ValueError("projection vector has incompatible length.")
         if self.X_scaled.shape[1] == 0:
             return b.copy()
-        coef = self._lsqr_projection_coefficients(b)
-        return b - np.asarray(self.X_scaled @ coef).reshape(-1)
+
+        if self._orthogonal_basis is not None:
+            Q = self._orthogonal_basis
+            out = b - Q @ (Q.T @ b)
+            certificate = self._projection_certificate(out)
+            self.projection_solve_count += 1
+            self.max_projection_certificate = max(
+                self.max_projection_certificate,
+                float(certificate),
+            )
+            return np.asarray(out, dtype=float)
+
+        return self._project_vector_sparse_certified(b)
 
     def project_dense_block(self, G: FloatArray) -> FloatArray:
         G = np.asarray(G, dtype=float)
@@ -283,46 +822,93 @@ class _SparseBaselineProjector:
             raise ValueError("projection block has incompatible shape.")
         if self.X_scaled.shape[1] == 0:
             return G.copy()
-        out = G.copy()
+
+        if self._orthogonal_basis is not None:
+            Q = self._orthogonal_basis
+            out = G - Q @ (Q.T @ G)
+            # Track a certificate per column without re-projecting.
+            for j in range(out.shape[1]):
+                certificate = self._projection_certificate(out[:, j])
+                self.max_projection_certificate = max(
+                    self.max_projection_certificate,
+                    float(certificate),
+                )
+            self.projection_solve_count += int(out.shape[1])
+            return np.asarray(out, dtype=float)
+
+        out = np.empty_like(G)
         for j in range(G.shape[1]):
-            coef = self._lsqr_projection_coefficients(G[:, j])
-            out[:, j] -= np.asarray(self.X_scaled @ coef).reshape(-1)
+            out[:, j] = self._project_vector_sparse_certified(G[:, j])
         return out
 
     def projected_gram_from_sparse_block(self, G: sp.csc_matrix) -> FloatArray:
-        """Compute G^T P_perp G for screening without forming P_perp G."""
+        """Compute ``G^T P_perp G`` for legacy conditional screening."""
 
         G = sp.csc_matrix(G, dtype=float)
         raw = np.asarray((G.T @ G).toarray(), dtype=float)
         if self.X_scaled.shape[1] == 0:
             return raw
+
+        # When an orthonormal basis is already cached, use it directly rather
+        # than routing a small problem through normal equations.
+        if self._orthogonal_basis is not None:
+            projected = self.project_dense_block(G.toarray())
+            H = projected.T @ projected
+            return 0.5 * (H + H.T)
+
+        if self.gram_lu is None:
+            raise RuntimeError(
+                "Projected self-Gram requested although the scalable design was "
+                "built without the legacy screening Gram factorisation."
+            )
         rhs = np.asarray((self.X_scaled.T @ G).toarray(), dtype=float)
         coef = np.asarray(self.gram_lu.solve(rhs), dtype=float)
         H = raw - rhs.T @ coef
         H = 0.5 * (H + H.T)
 
-        # Normal equations are used only for screening geometry.  Clip negative
-        # roundoff modes while preserving every numerically positive direction.
+        # Normal equations are used only for legacy screening geometry.  Clip
+        # negative roundoff modes while preserving positive directions.
         eig, vec = np.linalg.eigh(H)
         scale = max(float(np.max(np.abs(eig))) if eig.size else 0.0, 1.0e-300)
         tol = 500.0 * np.finfo(float).eps * scale
         eig = np.where(eig > tol, eig, 0.0)
         return (vec * eig[None, :]) @ vec.T
 
-
 def _build_sparse_anchor_design(
     D: FloatArray,
     edge_features: FloatArray,
+    feature_output_modes: Sequence[str],
 ) -> sp.csc_matrix:
     """Build the stationary edge-function design directly in CSC form."""
 
-    T, M, L = edge_features.shape
+    T, M, L = edge_features.shape[:3]
     N = D.shape[0]
-    edge_nnz = np.count_nonzero(D, axis=0).astype(np.int64)
-    total_nnz = int(T * L * int(edge_nnz.sum()))
+    index_dtype = np.int32 if T * N < np.iinfo(np.int32).max else np.int64
+
+    if edge_features.ndim == 4:
+        tail, head = _pair_endpoints_from_incidence(D)
+        nnz_per_col = 2 * T
+        total_nnz = M * L * nnz_per_col
+        data = np.empty(total_nnz, dtype=float)
+        indices = np.empty(total_nnz, dtype=index_dtype)
+        indptr = np.arange(0, total_nnz + 1, nnz_per_col, dtype=np.int64)
+        pos = 0
+        time_base = np.arange(T, dtype=np.int64) * N
+        for m in range(M):
+            rows = np.column_stack([time_base + tail[m], time_base + head[m]]).reshape(-1)
+            for ell in range(L):
+                n = rows.size
+                indices[pos:pos+n] = rows
+                data[pos:pos+n] = edge_features[:, m, ell, :].reshape(-1)
+                pos += n
+        return sp.csc_matrix((data, indices, indptr), shape=(T * N, M * L))
+
+    modes = tuple(feature_output_modes)
+    directions = _feature_output_directions(D, modes)  # (N,M,L)
+    nnz_per_feature = np.count_nonzero(directions, axis=0).astype(np.int64)  # (M,L)
+    total_nnz = int(T * int(nnz_per_feature.sum()))
 
     data = np.empty(total_nnz, dtype=float)
-    index_dtype = np.int32 if T * N < np.iinfo(np.int32).max else np.int64
     indices = np.empty(total_nnz, dtype=index_dtype)
     indptr = np.empty(M * L + 1, dtype=np.int64)
     indptr[0] = 0
@@ -331,10 +917,11 @@ def _build_sparse_anchor_design(
     pos = 0
     col = 0
     for m in range(M):
-        nodes = np.flatnonzero(D[:, m] != 0.0)
-        values = D[nodes, m]
-        rows = (time_rows + nodes[None, :]).reshape(-1)
         for ell in range(L):
+            direction = directions[:, m, ell]
+            nodes = np.flatnonzero(np.abs(direction) > 1.0e-14)
+            values = direction[nodes]
+            rows = (time_rows + nodes[None, :]).reshape(-1)
             n = rows.size
             indices[pos : pos + n] = rows
             data[pos : pos + n] = (
@@ -351,7 +938,7 @@ def _build_sparse_anchor_design(
 
 
 class _LazyProjectedChangeOperator:
-    """Cumulative temporal group blocks with sparse-anchor projection."""
+    """Cumulative temporal group blocks with feature-resolved output assembly."""
 
     def __init__(
         self,
@@ -359,6 +946,7 @@ class _LazyProjectedChangeOperator:
         edge_features: FloatArray,
         stage: IntArray,
         projector: _SparseBaselineProjector,
+        feature_output_modes: Sequence[str],
     ):
         self.D = np.asarray(D, dtype=float)
         self.edge_features = np.asarray(edge_features, dtype=float)
@@ -368,16 +956,45 @@ class _LazyProjectedChangeOperator:
         self.N = self.D.shape[0]
         self.K = int(np.max(self.stage))
         self.n_rows = int(self.T * self.N)
+        self.feature_output_modes = tuple(feature_output_modes)
+        if len(self.feature_output_modes) != self.L:
+            raise ValueError("feature_output_modes has incompatible length.")
+
+        self.output_directions = _feature_output_directions(
+            self.D, self.feature_output_modes
+        )  # (N,M,L)
+        self.mode_matrices: dict[str, FloatArray] = {}
+        inv_sqrt2 = 1.0 / np.sqrt(2.0)
+        for mode in sorted(set(self.feature_output_modes)):
+            if mode == "legacy_difference":
+                self.mode_matrices[mode] = self.D
+            elif mode == "difference":
+                self.mode_matrices[mode] = inv_sqrt2 * self.D
+            elif mode == "common":
+                self.mode_matrices[mode] = inv_sqrt2 * np.abs(self.D)
+            else:
+                raise RuntimeError(f"Unknown feature output mode {mode!r}.")
+        self.mode_indices = {
+            mode: np.asarray(
+                [ell for ell, value in enumerate(self.feature_output_modes) if value == mode],
+                dtype=np.int64,
+            )
+            for mode in self.mode_matrices
+        }
 
         self.active_indices = tuple(
             np.flatnonzero(self.stage >= (k + 1)) for k in range(self.K)
         )
         self.edge_nodes = tuple(
-            np.flatnonzero(self.D[:, m] != 0.0) for m in range(self.M)
+            np.flatnonzero(
+                np.any(np.abs(self.output_directions[:, m, :]) > 1.0e-14, axis=1)
+            )
+            for m in range(self.M)
         )
         self.edge_values = tuple(
-            self.D[self.edge_nodes[m], m].copy() for m in range(self.M)
-        )
+            self.output_directions[self.edge_nodes[m], m, :].copy()
+            for m in range(self.M)
+        )  # each is (n_endpoint_nodes, L)
         self._projected_block_cache: dict[GroupLabel, FloatArray] = {}
         self._projected_gram_cache: dict[GroupLabel, FloatArray] = {}
 
@@ -391,7 +1008,7 @@ class _LazyProjectedChangeOperator:
         k, m = self._validate_label(label)
         times = self.active_indices[k]
         nodes = self.edge_nodes[m]
-        values = self.edge_values[m]
+        values = self.edge_values[m]  # (nodes,L)
         nnz_per_col = int(times.size * nodes.size)
 
         data = np.empty(nnz_per_col * self.L, dtype=float)
@@ -409,7 +1026,7 @@ class _LazyProjectedChangeOperator:
             b = a + nnz_per_col
             indices[a:b] = rows
             data[a:b] = (
-                self.edge_features[times, m, ell, None] * values[None, :]
+                self.edge_features[times, m, ell, None] * values[None, :, ell]
             ).reshape(-1)
 
         return sp.csc_matrix(
@@ -451,22 +1068,75 @@ class _LazyProjectedChangeOperator:
         coordinates = vec[:, keep].T @ c
         return float(np.sum((coordinates * coordinates) / eig[keep]))
 
+    def _stage_feature_gradient(self, Vnode: FloatArray, ids: IntArray) -> FloatArray:
+        """Return feature-resolved edge gradients for one stage."""
+
+        G = np.zeros((self.M, self.L), dtype=float)
+        if not ids.size:
+            return G
+        psi = self.edge_features[ids]
+        for mode, H_mode in self.mode_matrices.items():
+            ell = self.mode_indices[mode]
+            if not ell.size:
+                continue
+            edge_signal = Vnode[ids] @ H_mode
+            tmp = np.einsum(
+                "tm,tml->ml",
+                edge_signal,
+                psi,
+                optimize=True,
+            )
+            G[:, ell] = tmp[:, ell]
+        return G
+
+    def group_adjoint_norm_provider(
+        self,
+        vector: FloatArray,
+        labels: tuple[GroupLabel, ...],
+    ) -> Mapping[GroupLabel, float]:
+        """Return ``||A_g^T vector||_2`` for requested temporal edge groups.
+
+        Because the vector and every projected working-set column lie in the
+        complement of the stationary anchor, ``A_g^T v = X_g^T v``.  The
+        feature-wise output modes therefore require only a small number of
+        batched node-to-edge contractions (legacy, common and/or difference),
+        followed by the same temporal suffix accumulation as before.
+        """
+
+        labels = tuple(self._validate_label(label) for label in labels)
+        if not labels:
+            return {}
+        v = np.asarray(vector, dtype=float).reshape(-1)
+        if v.size != self.n_rows:
+            raise ValueError("adjoint vector has incompatible length.")
+        Vnode = v.reshape(self.T, self.N)
+        R = self.K + 1
+
+        stage_grad: list[FloatArray] = []
+        for r in range(R):
+            ids = np.flatnonzero(self.stage == r)
+            stage_grad.append(self._stage_feature_gradient(Vnode, ids))
+
+        suffix_after: list[FloatArray] = [
+            np.zeros((self.M, self.L), dtype=float) for _ in range(self.K)
+        ]
+        suffix = np.zeros((self.M, self.L), dtype=float)
+        for r in range(R - 1, 0, -1):
+            suffix += stage_grad[r]
+            suffix_after[r - 1] = suffix.copy()
+
+        return {
+            label: float(np.linalg.norm(suffix_after[label[0]][label[1], :]))
+            for label in labels
+        }
+
     def conditional_gain_provider(
         self,
         residual: FloatArray,
         Q: FloatArray,
         omitted: tuple[GroupLabel, ...],
     ) -> tuple[GroupLabel, float]:
-        """Exact conditional-gain formula up to sparse-Gram roundoff.
-
-        Since both the current residual and selected-span basis already lie in
-        the complement of the stationary anchor,
-
-            A_g^T r = X_g^T r,
-            A_g^T Q = X_g^T Q.
-
-        Hence only the projected self-Gram ``A_g^T A_g`` must be precomputed.
-        """
+        """Legacy exact conditional-gain scan for feature-resolved outputs."""
 
         residual = np.asarray(residual, dtype=float).reshape(self.T, self.N)
         Q = np.asarray(Q, dtype=float)
@@ -480,20 +1150,29 @@ class _LazyProjectedChangeOperator:
             k, m = self._validate_label(raw_label)
             times = self.active_indices[k]
             nodes = self.edge_nodes[m]
-            values = self.edge_values[m]
-            psi = self.edge_features[times, m, :]
+            values = self.edge_values[m]  # (nodes,L)
+            psi = self.edge_features[times, m, :]  # (times,L)
 
-            local_residual = residual[np.ix_(times, nodes)] @ values
-            c = psi.T @ local_residual
+            local_node_residual = residual[np.ix_(times, nodes)]
+            local_signal = local_node_residual @ values  # (times,L)
+            c = np.sum(psi * local_signal, axis=0)
 
             H = self.projected_self_gram((k, m)).copy()
             if qdim:
-                local_Q = np.tensordot(
-                    Q3[times][:, nodes, :],
+                Q_local = Q3[times][:, nodes, :]  # (times,nodes,q)
+                # Each feature has its own endpoint-output direction.
+                local_Q = np.einsum(
+                    "tnq,nl->tlq",
+                    Q_local,
                     values,
-                    axes=(1, 0),
+                    optimize=True,
                 )
-                V = psi.T @ local_Q
+                V = np.einsum(
+                    "tl,tlq->lq",
+                    psi,
+                    local_Q,
+                    optimize=True,
+                )
                 H -= V @ V.T
 
             gain = self._gain_from_gram(c, H)
@@ -505,6 +1184,161 @@ class _LazyProjectedChangeOperator:
             raise RuntimeError("Conditional gain scan received no candidate groups.")
         return best_label, float(best_gain)
 
+
+
+class _LazyProjectedEndpointChangeOperator:
+    """Lazy cumulative operator for generalized endpoint-output edge features."""
+
+    def __init__(
+        self,
+        D: FloatArray,
+        endpoint_features: FloatArray,
+        stage: IntArray,
+        projector: _SparseBaselineProjector,
+    ):
+        self.D = np.asarray(D, dtype=float)
+        self.endpoint_features = np.asarray(endpoint_features, dtype=float)
+        self.stage = np.asarray(stage, dtype=np.int64)
+        self.projector = projector
+        self.T, self.M, self.L, two = self.endpoint_features.shape
+        if two != 2:
+            raise ValueError("endpoint feature tensor must have final dimension 2.")
+        self.N = self.D.shape[0]
+        self.K = int(np.max(self.stage))
+        self.n_rows = int(self.T * self.N)
+        self.tail, self.head = _pair_endpoints_from_incidence(self.D)
+        self.active_indices = tuple(
+            np.flatnonzero(self.stage >= (k + 1)) for k in range(self.K)
+        )
+        self._projected_block_cache: dict[GroupLabel, FloatArray] = {}
+        self._projected_gram_cache: dict[GroupLabel, FloatArray] = {}
+
+    def _validate_label(self, label: GroupLabel) -> tuple[int, int]:
+        k, m = int(label[0]), int(label[1])
+        if not (0 <= k < self.K and 0 <= m < self.M):
+            raise KeyError(f"Unknown temporal group {(k, m)!r}.")
+        return k, m
+
+    def raw_sparse_group_block(self, label: GroupLabel) -> sp.csc_matrix:
+        k, m = self._validate_label(label)
+        times = self.active_indices[k]
+        nnz_per_col = int(2 * times.size)
+        data = np.empty(nnz_per_col * self.L, dtype=float)
+        index_dtype = np.int32 if self.n_rows < np.iinfo(np.int32).max else np.int64
+        indices = np.empty(nnz_per_col * self.L, dtype=index_dtype)
+        indptr = np.arange(
+            0, (self.L + 1) * nnz_per_col, nnz_per_col, dtype=np.int64
+        )
+        rows = np.column_stack(
+            [times * self.N + self.tail[m], times * self.N + self.head[m]]
+        ).reshape(-1)
+        for ell in range(self.L):
+            a = ell * nnz_per_col
+            b = a + nnz_per_col
+            indices[a:b] = rows
+            data[a:b] = self.endpoint_features[times, m, ell, :].reshape(-1)
+        return sp.csc_matrix(
+            (data, indices, indptr), shape=(self.n_rows, self.L)
+        )
+
+    def projected_group_block(self, label: GroupLabel) -> FloatArray:
+        label = self._validate_label(label)
+        cached = self._projected_block_cache.get(label)
+        if cached is not None:
+            return cached
+        raw = self.raw_sparse_group_block(label).toarray()
+        projected = self.projector.project_dense_block(raw)
+        self._projected_block_cache[label] = projected
+        return projected
+
+    def projected_self_gram(self, label: GroupLabel) -> FloatArray:
+        label = self._validate_label(label)
+        cached = self._projected_gram_cache.get(label)
+        if cached is not None:
+            return cached
+        raw = self.raw_sparse_group_block(label)
+        H = self.projector.projected_gram_from_sparse_block(raw)
+        self._projected_gram_cache[label] = H
+        return H
+
+    def _stage_feature_gradient(self, Vnode: FloatArray, ids: IntArray) -> FloatArray:
+        if not ids.size:
+            return np.zeros((self.M, self.L), dtype=float)
+        Et = self.endpoint_features[ids, :, :, 0]
+        Eh = self.endpoint_features[ids, :, :, 1]
+        vt = Vnode[ids][:, self.tail]
+        vh = Vnode[ids][:, self.head]
+        return (
+            np.einsum("tm,tml->ml", vt, Et, optimize=True)
+            + np.einsum("tm,tml->ml", vh, Eh, optimize=True)
+        )
+
+    def group_adjoint_norm_provider(
+        self,
+        vector: FloatArray,
+        labels: tuple[GroupLabel, ...],
+    ) -> Mapping[GroupLabel, float]:
+        labels = tuple(self._validate_label(label) for label in labels)
+        if not labels:
+            return {}
+        v = np.asarray(vector, dtype=float).reshape(-1)
+        if v.size != self.n_rows:
+            raise ValueError("adjoint vector has incompatible length.")
+        Vnode = v.reshape(self.T, self.N)
+        R = self.K + 1
+        stage_grad = [
+            self._stage_feature_gradient(Vnode, np.flatnonzero(self.stage == r))
+            for r in range(R)
+        ]
+        suffix_after = [
+            np.zeros((self.M, self.L), dtype=float) for _ in range(self.K)
+        ]
+        suffix = np.zeros((self.M, self.L), dtype=float)
+        for r in range(R - 1, 0, -1):
+            suffix += stage_grad[r]
+            suffix_after[r - 1] = suffix.copy()
+        return {
+            label: float(np.linalg.norm(suffix_after[label[0]][label[1], :]))
+            for label in labels
+        }
+
+    def conditional_gain_provider(
+        self,
+        residual: FloatArray,
+        Q: FloatArray,
+        omitted: tuple[GroupLabel, ...],
+    ) -> tuple[GroupLabel, float]:
+        residual = np.asarray(residual, dtype=float).reshape(self.T, self.N)
+        Q = np.asarray(Q, dtype=float)
+        qdim = int(Q.shape[1])
+        Q3 = Q.reshape(self.T, self.N, qdim) if qdim else None
+        best_label: Optional[GroupLabel] = None
+        best_gain = -np.inf
+        for raw_label in omitted:
+            k, m = self._validate_label(raw_label)
+            times = self.active_indices[k]
+            Et = self.endpoint_features[times, m, :, 0]
+            Eh = self.endpoint_features[times, m, :, 1]
+            rt = residual[times, self.tail[m]][:, None]
+            rh = residual[times, self.head[m]][:, None]
+            c = np.sum(rt * Et + rh * Eh, axis=0)
+
+            H = self.projected_self_gram((k, m)).copy()
+            if qdim:
+                Qt = Q3[times, self.tail[m], :]
+                Qh = Q3[times, self.head[m], :]
+                V = (
+                    np.einsum("tl,tq->lq", Et, Qt, optimize=True)
+                    + np.einsum("tl,tq->lq", Eh, Qh, optimize=True)
+                )
+                H -= V @ V.T
+            gain = _LazyProjectedChangeOperator._gain_from_gram(c, H)
+            if gain > best_gain:
+                best_gain = gain
+                best_label = (k, m)
+        if best_label is None:
+            raise RuntimeError("Conditional gain scan received no candidate groups.")
+        return best_label, float(best_gain)
 
 def _estimate_explicit_dense_design_bytes(
     *,
@@ -529,10 +1363,14 @@ def build_scalable_cumulative_change_design(
     edge_features: ArrayLike,
     stage_of_sample: Sequence[int],
     *,
+    feature_output_modes: Optional[Sequence[str]] = None,
     stationary_nuisance: Optional[ArrayLike] = None,
     projection_tol: float = 1.0e-16,
     projection_max_iter: Optional[int] = None,
     diagnostic_dense_bytes: int = 64 * 1024**2,
+    projection_certificate_tol: float = 1.0e-12,
+    projection_refinement_passes: int = 2,
+    require_projected_gram: bool = True,
 ) -> ScalableCumulativeChangeDesign:
     """Build the lazy/sparse Step-2 design used by ``backend='scalable'``."""
 
@@ -542,8 +1380,19 @@ def build_scalable_cumulative_change_design(
     T, N = Y.shape
     M = D.shape[1]
     L = edge_features.shape[2]
+    if edge_features.ndim == 4:
+        if feature_output_modes is not None:
+            raise ValueError(
+                "feature_output_modes must be omitted when edge_features already "
+                "contains endpoint outputs with shape (T,M,L,2)."
+            )
+        output_modes = tuple("endpoint_pair" for _ in range(L))
+        feature_representation = "endpoint_pairwise"
+    else:
+        output_modes = _resolve_feature_output_modes(L, feature_output_modes)
+        feature_representation = "scalar_mode_resolved"
 
-    X_anchor = _build_sparse_anchor_design(D, edge_features)
+    X_anchor = _build_sparse_anchor_design(D, edge_features, output_modes)
     nuisance = _coerce_stationary_nuisance(
         stationary_nuisance,
         n_samples=T,
@@ -562,6 +1411,9 @@ def build_scalable_cumulative_change_design(
         projection_tol=projection_tol,
         projection_max_iter=projection_max_iter,
         diagnostic_dense_bytes=diagnostic_dense_bytes,
+        projection_certificate_tol=projection_certificate_tol,
+        projection_refinement_passes=projection_refinement_passes,
+        require_projected_gram=require_projected_gram,
     )
 
     y = Y.reshape(T * N)
@@ -576,12 +1428,14 @@ def build_scalable_cumulative_change_design(
             group_columns[label] = start + np.arange(L, dtype=np.int64)
             group_order.append(label)
 
-    operator = _LazyProjectedChangeOperator(
-        D,
-        edge_features,
-        stage,
-        projector,
-    )
+    if edge_features.ndim == 4:
+        operator = _LazyProjectedEndpointChangeOperator(
+            D, edge_features, stage, projector
+        )
+    else:
+        operator = _LazyProjectedChangeOperator(
+            D, edge_features, stage, projector, output_modes
+        )
 
     return ScalableCumulativeChangeDesign(
         y=np.asarray(y, dtype=float),
@@ -598,6 +1452,8 @@ def build_scalable_cumulative_change_design(
         n_nodes=int(N),
         n_edges=int(M),
         n_edge_features=int(L),
+        feature_output_modes=tuple(output_modes),
+        feature_representation=str(feature_representation),
         n_transitions=int(K),
         n_base_columns=int(X_base.shape[1]),
         anchor_nnz=int(X_anchor.nnz),
@@ -608,7 +1464,7 @@ def build_scalable_cumulative_change_design(
             n_edge_features=L,
             n_transitions=K,
         ),
-        baseline_projection_backend="sparse-lsqr",
+        baseline_projection_backend=str(projector.projection_backend),
         _operator=operator,
     )
 
@@ -670,6 +1526,7 @@ class RankedPrefixSelectionResult:
 SparseSolverResult = (
     GroupBasisPursuitResult
     | ScreenedGroupBasisPursuitResult
+    | WorkingSetGroupBasisPursuitResult
     | AdaptiveGroupLassoResult
     | ForwardBackwardGroupSearchResult
 )
@@ -710,10 +1567,15 @@ def _validate_observations(
         raise ValueError("Y must have shape (n_observations, n_nodes).")
     if D.ndim != 2:
         raise ValueError("D must have shape (n_nodes, n_candidate_edges).")
-    if edge_features.ndim != 3:
+    if edge_features.ndim not in {3, 4}:
         raise ValueError(
-            "edge_features must have shape "
-            "(n_observations, n_candidate_edges, n_edge_features)."
+            "edge_features must have shape (T,M,L) for scalar/mode-resolved "
+            "features or (T,M,L,2) for generalized endpoint-output features."
+        )
+    if edge_features.ndim == 4 and edge_features.shape[3] != 2:
+        raise ValueError(
+            "General endpoint-output edge_features must have final dimension 2 "
+            "ordered as (tail contribution, head contribution)."
         )
 
     T, N = Y.shape
@@ -722,8 +1584,7 @@ def _validate_observations(
     M = D.shape[1]
     if edge_features.shape[:2] != (T, M):
         raise ValueError(
-            "edge_features.shape[:2] must equal "
-            "(Y.shape[0], D.shape[1])."
+            "edge_features.shape[:2] must equal (Y.shape[0], D.shape[1])."
         )
     if stage.size != T:
         raise ValueError("stage_of_sample must have one entry per observation.")
@@ -737,6 +1598,9 @@ def _validate_observations(
         raise ValueError("edge_features must be finite.")
     if np.any(stage < 0):
         raise ValueError("stage_of_sample must contain non-negative stage labels.")
+
+    if edge_features.ndim == 4:
+        _validate_standard_pairwise_incidence(D)
 
     unique = np.unique(stage)
     if unique.size == 0 or unique[0] != 0:
@@ -850,6 +1714,7 @@ def build_cumulative_change_design(
     edge_features: ArrayLike,
     stage_of_sample: Sequence[int],
     *,
+    feature_output_modes: Optional[Sequence[str]] = None,
     stationary_nuisance: Optional[ArrayLike] = None,
 ) -> CumulativeChangeDesign:
     """Build the blind global cumulative Step-2 regression.
@@ -880,11 +1745,27 @@ def build_cumulative_change_design(
     T, N = Y.shape
     M = D.shape[1]
     L = edge_features.shape[2]
-
-    # Per-observation, per-edge, per-feature contribution to node space:
-    #     d_m * psi_{t,m,l}
-    # Shape: (T, N, M, L).
-    pair_basis = D[None, :, :, None] * edge_features[:, None, :, :]
+    if edge_features.ndim == 4:
+        if feature_output_modes is not None:
+            raise ValueError(
+                "feature_output_modes must be omitted when edge_features already "
+                "contains endpoint outputs with shape (T,M,L,2)."
+            )
+        output_modes = tuple("endpoint_pair" for _ in range(L))
+        feature_representation = "endpoint_pairwise"
+        tail, head = _pair_endpoints_from_incidence(D)
+        pair_basis = np.zeros((T, N, M, L), dtype=float)
+        for m in range(M):
+            pair_basis[:, tail[m], m, :] = edge_features[:, m, :, 0]
+            pair_basis[:, head[m], m, :] = edge_features[:, m, :, 1]
+    else:
+        output_modes = _resolve_feature_output_modes(L, feature_output_modes)
+        feature_representation = "scalar_mode_resolved"
+        # Historical calls (feature_output_modes=None) use D[:,m] exactly.
+        # General orientation-equivariant scalar calls use |D|/sqrt(2) for
+        # common/even features and D/sqrt(2) for difference/odd features.
+        output_directions = _feature_output_directions(D, output_modes)
+        pair_basis = output_directions[None, :, :, :] * edge_features[:, None, :, :]
 
     y = Y.reshape(T * N)
     X_anchor = pair_basis.reshape(T * N, M * L)
@@ -943,6 +1824,8 @@ def build_cumulative_change_design(
         n_nodes=int(N),
         n_edges=int(M),
         n_edge_features=int(L),
+        feature_output_modes=tuple(output_modes),
+        feature_representation=str(feature_representation),
         n_transitions=int(K),
     )
 
@@ -1408,6 +2291,7 @@ def infer_sparse_row_changes_from_observations(
     transition_times: Optional[Sequence[float]] = None,
     edge_labels: Optional[Sequence[Hashable]] = None,
     stationary_nuisance: Optional[ArrayLike] = None,
+    feature_output_modes: Optional[Sequence[str]] = None,
     uncertainty_floor: Optional[float] = None,
     profile_floor: Optional[float] = None,
     solver_method: Literal[
@@ -1416,6 +2300,7 @@ def infer_sparse_row_changes_from_observations(
         "forward_backward_floor",
     ] = "group_bpdn_prefix",
     backend: Literal["dense", "scalable", "auto"] = "dense",
+    scalable_solver: Literal["working_set", "screened"] = "working_set",
     dense_memory_limit_bytes: int = 512 * 1024**2,
     scalable_projection_tol: float = 1.0e-16,
     scalable_projection_max_iter: Optional[int] = None,
@@ -1430,11 +2315,13 @@ def infer_sparse_row_changes_from_observations(
     """Infer row-sparse temporal changes from preprocessed observations.
 
     ``backend='dense'`` preserves the original correctness/reference path.
-    ``backend='scalable'`` uses sparse anchor projection, lazy temporal group
-    blocks, conditional feasibility screening, restricted BPDN ranking, and the
-    same floor-certified prefix selection.  ``backend='auto'`` dispatches only
-    from a conservative explicit-design memory estimate; it never inspects an
-    inference result to decide the backend.
+    ``backend='scalable'`` uses sparse anchor projection and lazy temporal
+    group blocks.  By default ``scalable_solver='working_set'`` uses batched
+    seeding plus global dual/KKT reactivation to certify the full grouped-BPDN
+    optimum before the same floor-certified prefix selection.  The older
+    ``scalable_solver='screened'`` path is retained for regression comparisons.
+    ``backend='auto'`` dispatches only from a conservative explicit-design
+    memory estimate; it never inspects an inference result to decide the backend.
     """
 
     floor = _resolve_uncertainty_floor(
@@ -1451,6 +2338,14 @@ def infer_sparse_row_changes_from_observations(
     T0, N0 = Y0.shape
     M0 = D0.shape[1]
     L0 = edge0.shape[2]
+    if edge0.ndim == 4:
+        if feature_output_modes is not None:
+            raise ValueError(
+                "feature_output_modes must be omitted for endpoint-output features."
+            )
+        output_modes0 = None
+    else:
+        output_modes0 = _resolve_feature_output_modes(L0, feature_output_modes)
     estimated_dense_bytes = _estimate_explicit_dense_design_bytes(
         n_samples=T0,
         n_nodes=N0,
@@ -1462,6 +2357,9 @@ def infer_sparse_row_changes_from_observations(
     backend_requested = str(backend)
     if backend_requested not in {"dense", "scalable", "auto"}:
         raise ValueError("backend must be 'dense', 'scalable', or 'auto'.")
+    scalable_solver = str(scalable_solver).lower()
+    if scalable_solver not in {"working_set", "screened"}:
+        raise ValueError("scalable_solver must be 'working_set' or 'screened'.")
     if backend_requested == "auto":
         if solver_method != "group_bpdn_prefix":
             backend_used = "dense"
@@ -1481,6 +2379,7 @@ def infer_sparse_row_changes_from_observations(
                 D0,
                 edge0,
                 stage0,
+                feature_output_modes=output_modes0,
                 stationary_nuisance=stationary_nuisance,
             )
         )
@@ -1496,9 +2395,16 @@ def infer_sparse_row_changes_from_observations(
             D0,
             edge0,
             stage0,
+            feature_output_modes=output_modes0,
             stationary_nuisance=stationary_nuisance,
             projection_tol=scalable_projection_tol,
             projection_max_iter=scalable_projection_max_iter,
+            projection_certificate_tol=max(
+                100.0 * np.finfo(float).eps,
+                0.05 * float(floor),
+            ),
+            projection_refinement_passes=2,
+            require_projected_gram=(scalable_solver == "screened"),
         )
 
     K = design.n_transitions
@@ -1575,18 +2481,37 @@ def infer_sparse_row_changes_from_observations(
                     restricted[key] = screened_kwargs.pop(key)
             verbose_flag = bool(screened_kwargs.pop("verbose", True))
 
-            solver_result = solve_screened_group_basis_pursuit_denoising(
-                design.y_perp,
-                design.group_columns,
-                n_coefficients=K * M * L,
-                group_block_provider=design.group_block,
-                target_relative_residual=float(floor),
-                conditional_gain_provider=design.conditional_gain_provider,
-                restricted_solver_kwargs=restricted,
-                require_restricted_convergence=require_solver_convergence,
-                verbose=verbose_flag,
-                **screened_kwargs,
-            )
+            if scalable_solver == "working_set":
+                # TIDES designs are highly coherent; a constant modest batch is
+                # less prone to overshooting the useful working-set size than
+                # geometric seed growth.  Callers may override either value.
+                screened_kwargs.setdefault("seed_batch_size", 8)
+                screened_kwargs.setdefault("seed_growth_factor", 1.0)
+                solver_result = solve_working_set_group_basis_pursuit_denoising(
+                    design.y_perp,
+                    design.group_columns,
+                    n_coefficients=K * M * L,
+                    group_block_provider=design.group_block,
+                    target_relative_residual=float(floor),
+                    group_adjoint_norm_provider=design.group_adjoint_norm_provider,
+                    restricted_solver_kwargs=restricted,
+                    require_restricted_convergence=require_solver_convergence,
+                    verbose=verbose_flag,
+                    **screened_kwargs,
+                )
+            else:
+                solver_result = solve_screened_group_basis_pursuit_denoising(
+                    design.y_perp,
+                    design.group_columns,
+                    n_coefficients=K * M * L,
+                    group_block_provider=design.group_block,
+                    target_relative_residual=float(floor),
+                    conditional_gain_provider=design.conditional_gain_provider,
+                    restricted_solver_kwargs=restricted,
+                    require_restricted_convergence=require_solver_convergence,
+                    verbose=verbose_flag,
+                    **screened_kwargs,
+                )
             selection_result = _certify_ranked_prefixes_scalable(
                 design,
                 solver_result.ranking,
@@ -1705,6 +2630,7 @@ def infer_sparse_row_changes_from_observations(
         "backend": f"global-cumulative-{backend_used}-{solver_method}",
         "computational_backend_requested": backend_requested,
         "computational_backend_used": backend_used,
+        "scalable_solver": scalable_solver if backend_used == "scalable" else None,
         "oracle_information_used": False,
         "solver_method": str(solver_method),
         "n_preprocessed_observations": int(design.n_samples),
@@ -1712,6 +2638,12 @@ def infer_sparse_row_changes_from_observations(
         "n_nodes": int(design.n_nodes),
         "n_candidate_edges": int(M),
         "n_edge_features": int(L),
+        "feature_output_modes": tuple(design.feature_output_modes),
+        "feature_representation": str(design.feature_representation),
+        "output_generalization_active": bool(
+            design.feature_representation != "scalar_mode_resolved"
+            or any(mode != "legacy_difference" for mode in design.feature_output_modes)
+        ),
         "n_transitions": int(K),
         "n_candidate_groups": int(K * M),
         "coefficients_per_group": int(L),
@@ -1736,6 +2668,21 @@ def infer_sparse_row_changes_from_observations(
                 "baseline_projection_backend": design.baseline_projection_backend,
                 "sparse_anchor_nnz": int(design.anchor_nnz),
                 "scalable_projection_tol": float(scalable_projection_tol),
+                "scalable_projection_certificate_tol": float(
+                    design._operator.projector.projection_certificate_tol
+                ),
+                "max_projection_anchor_cosine": float(
+                    design._operator.projector.max_projection_certificate
+                ),
+                "projection_solve_count": int(
+                    design._operator.projector.projection_solve_count
+                ),
+                "projection_refinement_count": int(
+                    design._operator.projector.projection_refinement_count
+                ),
+                "max_projection_lsqr_iterations": int(
+                    design._operator.projector.max_lsqr_iterations
+                ),
             }
         )
 
@@ -1746,6 +2693,46 @@ def infer_sparse_row_changes_from_observations(
             convex_fixed_point = float(solver_result.fixed_point_residual)
             convex_rank = int(solver_result.design_rank)
             projection_backend = str(solver_result.projection_backend)
+            metadata.update(
+                {
+                    "convex_duality_gap": float(solver_result.duality_gap),
+                    "convex_max_dual_group_ratio": float(
+                        solver_result.max_dual_group_ratio
+                    ),
+                    "convex_dual_feasible": bool(solver_result.dual_feasible),
+                }
+            )
+        elif isinstance(solver_result, WorkingSetGroupBasisPursuitResult):
+            restricted_result = solver_result.restricted_result
+            convex_iterations = int(restricted_result.iterations)
+            convex_fixed_point = float(restricted_result.fixed_point_residual)
+            convex_rank = int(restricted_result.design_rank)
+            projection_backend = str(solver_result.projection_backend)
+            metadata.update(
+                {
+                    "seed_group_count": int(len(solver_result.seed_groups)),
+                    "working_set_group_count": int(len(solver_result.working_set)),
+                    "seed_scans": int(solver_result.seed_scans),
+                    "kkt_audits": int(solver_result.kkt_audits),
+                    "working_set_expansions": int(
+                        solver_result.working_set_expansions
+                    ),
+                    "total_reactivations": int(solver_result.total_reactivations),
+                    "max_global_dual_ratio": float(
+                        solver_result.max_global_dual_ratio
+                    ),
+                    "global_dual_feasible": bool(
+                        solver_result.global_dual_feasible
+                    ),
+                    "global_duality_gap": float(solver_result.global_duality_gap),
+                    "restricted_group_count": int(
+                        solver_result.n_restricted_groups
+                    ),
+                    "peak_restricted_columns": int(
+                        solver_result.peak_restricted_columns
+                    ),
+                }
+            )
         else:
             assert isinstance(solver_result, ScreenedGroupBasisPursuitResult)
             restricted_result = solver_result.restricted_result
@@ -1883,6 +2870,10 @@ infer_change_structure = infer_change_structure_from_observations
 
 
 __all__ = [
+    "PairwisePolynomialFeatures",
+    "build_pairwise_polynomial_features",
+    "PairwiseEndpointPolynomialFeatures",
+    "build_pairwise_endpoint_polynomial_features",
     "CumulativeChangeDesign",
     "ScalableCumulativeChangeDesign",
     "SparseRowConstraint",

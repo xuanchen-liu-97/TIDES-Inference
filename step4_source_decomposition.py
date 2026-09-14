@@ -17,6 +17,12 @@ where
     W^(r) : (M,) microscopic edge amplitudes,
     theta : (L,) shared interaction-law direction.
 
+The feature axis may contain ordinary legacy incidence-flow features or the
+orientation-equivariant common/difference output sectors introduced by the
+general pairwise representation.  Step 4 is intentionally agnostic to that
+coordinate interpretation: once Step 3 returns an ``(R,M,L)`` coefficient
+tensor, the shared-law hypothesis remains the same rank-one factorisation.
+
 Stacking all stage-edge rows gives
 
     B_stack in R^((R M) x L),
@@ -356,9 +362,24 @@ def decompose_shared_interaction_law(
         only in metadata and never alter the factorization.
     """
 
+    source_metadata = getattr(B_stages_or_step3_result, "metadata", None)
+    inherited_output_modes = None
+    inherited_feature_representation = None
+    if isinstance(source_metadata, dict):
+        raw_modes = source_metadata.get("feature_output_modes")
+        if raw_modes is not None:
+            inherited_output_modes = tuple(str(x) for x in raw_modes)
+        raw_representation = source_metadata.get("feature_representation")
+        if raw_representation is not None:
+            inherited_feature_representation = str(raw_representation)
+
     B = _extract_B_stages(B_stages_or_step3_result)
 
     R, M, L = B.shape
+    if inherited_output_modes is not None and len(inherited_output_modes) != L:
+        raise ValueError(
+            "Step-3 feature_output_modes metadata has incompatible length for Step 4."
+        )
     B_stack = B.reshape(R * M, L)
 
     U, singular_values, Vt = np.linalg.svd(
@@ -454,6 +475,15 @@ def decompose_shared_interaction_law(
         "n_stages": int(R),
         "n_edges": int(M),
         "n_edge_features": int(L),
+        "feature_output_modes": inherited_output_modes,
+        "feature_representation": inherited_feature_representation,
+        "output_generalization_active": bool(
+            inherited_feature_representation not in {None, "scalar_mode_resolved"}
+            or (
+                inherited_output_modes is not None
+                and any(mode != "legacy_difference" for mode in inherited_output_modes)
+            )
+        ),
         "stacked_rows": int(R * M),
         "normalization": str(normalization),
         "reference_component": int(reference_component),

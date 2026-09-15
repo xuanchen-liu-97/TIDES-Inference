@@ -1,23 +1,32 @@
-"""Numerical profiling for TIDES Step 3 conditional-MDL search.
+"""Fixed-model numerical profiling for TIDES conditional-MDL search.
 
-This module separates continuous physical fitting from discrete model-space
-search.  The generic linear tools remain useful for hypothesis-specific
-adapters.  The primary implemented physical branch is H_FD,
+This module is intentionally separate from the outer combinatorial search.
+Given a concrete linear design A for a fixed discrete model (S, J), it answers:
 
-    B^(r) = W^(r) Theta^T,
+1. Can the model class enter the observational uncertainty ball at all?
+2. Can we exhibit a q-bit coefficient vector that remains in the ball?
 
-parameterized for coding/search by the invertible structural coordinates
-W^(1), Delta W^(1),...,Delta W^(K-1).  These coordinates are introduced only
-in Step 3; the Step-2 canonical object remains the absolute edge-space family
-B_epsilon.
+The second question is *not* equivalent to rounding one arbitrary least-squares
+representative.  Rank-deficient TIDES designs possess large observational
+fibres, and the minimum-MDL representative may live far along a null direction.
+Accordingly the code distinguishes:
 
-For fixed active structural groups and active interaction atoms, scalar
-structural amplitudes are profiled exactly for every shared law Theta.  The
-remaining nonlinear search is therefore only over |J|-1 gauge-fixed dynamics
-coefficients.
+- an ``optimal`` continuous profile used only to certify the best achievable
+  residual of the model class; and
+- a ``seed`` continuous representative used to search for short quantized
+  witnesses.  By default the seed is the canonical unscaled minimum-Euclidean-
+  norm least-squares solution whenever it is already floor-feasible.  This is a
+  much better starting point than the column-scaled numerical representative in
+  strongly rank-deficient polynomial designs.
 
-The finite-precision routines return feasible q-bit witnesses.  Unless an exact
-lattice certificate is supplied, q is an upper bound on the true q_star.
+The exact manuscript quantizer Q_q is still an open design choice.  The
+``UniformDyadicQuantizer`` below is therefore explicitly a reference/smoke-test
+quantizer.  Its fixed range is caller-declared side information.
+
+The current lattice search returns a feasible witness and hence an *upper bound*
+on q_star.  It does not certify that no lower-q point exists.  Final scientific
+MDL search must either certify this inner problem or use lower/upper bounds that
+are sufficient for the acceptance decision.
 """
 
 from __future__ import annotations
@@ -412,15 +421,30 @@ def profile_precision_witness(
     )
 
 
-
 # -----------------------------------------------------------------------------
-# Fixed dynamics: shared interaction law, free physical structural amplitudes
+# Fixed-dynamics hypothesis: shared polynomial law, varying scalar structure
 # -----------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class FixedDynamicsProfile:
-    """Continuous profile of one H_FD structural/expression model."""
+    """Continuous profile under H = fixed dynamics / varying structure.
+
+    The model is
+
+        y = sum_a w_a B_a theta + r,
+
+    where the stationary-anchor amplitudes and the active temporal-change
+    amplitudes are free scalars, while every block shares one polynomial law
+    ``theta``.  The scale gauge is fixed by setting the lowest-index active atom
+    to exactly +1.  That pivot is side information implied by the deterministic
+    gauge rule and is therefore not counted as a free precision parameter.
+
+    ``relaxed_relative_residual`` is the residual of the unrestricted linear
+    relaxation in which every block has its own polynomial coefficient vector.
+    It is a rigorous lower bound on the fixed-dynamics residual and can certify
+    infeasibility when it already exceeds the uncertainty floor.
+    """
 
     active_atoms: tuple[int, ...]
     pivot_atom: int
@@ -435,12 +459,14 @@ class FixedDynamicsProfile:
     y_norm: float
     uncertainty_floor: float
     threshold_sq: float
+    n_baseline_amplitudes: int
+    n_change_amplitudes: int
     optimizer_nfev: int
     optimizer_success: bool
 
     @property
-    def n_structural_amplitudes(self) -> int:
-        return int(self.amplitudes.size)
+    def n_amplitudes(self) -> int:
+        return int(self.n_baseline_amplitudes + self.n_change_amplitudes)
 
     @property
     def n_free_dynamics_coefficients(self) -> int:
@@ -448,7 +474,7 @@ class FixedDynamicsProfile:
 
     @property
     def n_free_parameters(self) -> int:
-        return int(self.n_structural_amplitudes + self.n_free_dynamics_coefficients)
+        return int(self.n_amplitudes + self.n_free_dynamics_coefficients)
 
 
 @dataclass(frozen=True)
@@ -479,53 +505,27 @@ class FixedDynamicsPrecisionProfile:
         return self.q_upper if self.certified_exact else None
 
 
-@dataclass(frozen=True)
-class FixedDynamicsVarProWorkspace:
-    """Cached geometry for repeated shared-law variable projection.
-
-    ``derivative_blocks[j,:,a]`` is the observation-space contribution of
-    structural amplitude ``a`` for unit coefficient of active atom ``j``.
-    """
-
-    y: FloatArray
-    derivative_blocks: FloatArray  # (n_active_atoms, n_rows, n_amplitudes)
-    active_atoms: tuple[int, ...]
-    pivot_atom: int
-    y_norm: float
-    uncertainty_floor: float
-    threshold_sq: float
-    full_library_size: int
-    relaxed_relative_residual: float
-    relaxation_proves_infeasible: bool
-
-    @property
-    def n_amplitudes(self) -> int:
-        return int(self.derivative_blocks.shape[2])
-
-
 def _validate_fixed_dynamics_blocks(
     y: FloatArray,
-    structural_blocks: Sequence[FloatArray],
-) -> tuple[FloatArray, tuple[FloatArray, ...], int]:
+    baseline_blocks: Sequence[FloatArray],
+    change_blocks: Sequence[FloatArray],
+) -> tuple[FloatArray, tuple[FloatArray, ...], tuple[FloatArray, ...], int]:
     y = np.asarray(y, dtype=float).reshape(-1)
     if y.size == 0:
         raise ValueError("y must be non-empty.")
-    blocks = tuple(np.asarray(B, dtype=float) for B in structural_blocks)
-    if not blocks:
-        raise ValueError("At least one active structural block is required.")
-    if blocks[0].ndim != 2:
-        raise ValueError("Each structural block must be two-dimensional.")
-    L = int(blocks[0].shape[1])
-    if L < 1:
-        raise ValueError("Structural blocks must contain at least one library atom.")
-    for i, B in enumerate(blocks):
-        if B.shape != (y.size, L):
+    baseline = tuple(np.asarray(B, dtype=float) for B in baseline_blocks)
+    changes = tuple(np.asarray(B, dtype=float) for B in change_blocks)
+    all_blocks = baseline + changes
+    if not all_blocks:
+        raise ValueError("At least one baseline or change block is required.")
+    L = int(all_blocks[0].shape[1])
+    for i, B in enumerate(all_blocks):
+        if B.ndim != 2 or B.shape != (y.size, L):
             raise ValueError(
-                f"structural block {i} has shape {B.shape}; expected {(y.size, L)}."
+                f"fixed-dynamics block {i} has shape {B.shape}; "
+                f"expected {(y.size, L)}."
             )
-        if not np.all(np.isfinite(B)):
-            raise ValueError(f"structural block {i} contains non-finite values.")
-    return y, blocks, L
+    return y, baseline, changes, L
 
 
 def _fixed_dynamics_prediction(
@@ -536,30 +536,430 @@ def _fixed_dynamics_prediction(
     amplitudes = np.asarray(amplitudes, dtype=float).reshape(-1)
     theta = np.asarray(theta, dtype=float).reshape(-1)
     if len(blocks) != amplitudes.size:
-        raise ValueError("amplitudes must match structural_blocks.")
+        raise ValueError("amplitudes must match the number of blocks.")
+    if not blocks:
+        return np.zeros(0, dtype=float)
     pred = np.zeros(blocks[0].shape[0], dtype=float)
     for a, B in zip(amplitudes, blocks):
         pred += float(a) * (B @ theta)
     return pred
 
 
-def build_fixed_dynamics_varpro_workspace(
+def profile_fixed_dynamics(
     y: FloatArray,
-    structural_blocks: Sequence[FloatArray],
+    baseline_blocks: Sequence[FloatArray],
+    change_blocks: Sequence[FloatArray],
     *,
     active_atoms: Sequence[int],
     uncertainty_floor: float,
+    warm_theta: Optional[FloatArray] = None,
+    max_nfev: int = 250,
     compute_linear_relaxation: bool = True,
-) -> FixedDynamicsVarProWorkspace:
-    """Precompute one fixed-support H_FD variable-projection workspace."""
+    include_default_start: bool = True,
+) -> FixedDynamicsProfile:
+    """Profile a fixed-dynamics model by variable projection.
 
-    y, blocks, L = _validate_fixed_dynamics_blocks(y, structural_blocks)
+    For a fixed shared law theta, all scalar amplitudes are solved exactly by
+    least squares.  Only the ``|J|-1`` free law coefficients are optimized
+    nonlinearly.  Residuals are scaled by the uncertainty radius so that the
+    optimizer remains numerically sensitive at the very small TIDES floor.
+
+    The routine returns a *feasible witness* when it enters the floor.  Failure
+    to enter the floor is not, by itself, a certificate of infeasibility because
+    the rank-one/shared-law problem is nonconvex.  The unrestricted linear
+    relaxation provides a rigorous infeasibility certificate when requested.
+    """
+
+    from scipy.optimize import least_squares
+
+    y, baseline, changes, L = _validate_fixed_dynamics_blocks(
+        y, baseline_blocks, change_blocks
+    )
     atoms = tuple(sorted(set(int(a) for a in active_atoms)))
     if not atoms:
-        raise ValueError("active_atoms must be non-empty under H_FD.")
+        raise ValueError("active_atoms must be non-empty under fixed dynamics.")
     if any(a < 0 or a >= L for a in atoms):
         raise ValueError("active_atoms contains an out-of-range atom index.")
 
+    pivot = int(atoms[0])
+    free_atoms = tuple(a for a in atoms if a != pivot)
+    y_norm = float(np.linalg.norm(y))
+    if y_norm <= np.finfo(float).tiny:
+        raise ValueError("y must have nonzero norm.")
+    eps = float(uncertainty_floor)
+    if not np.isfinite(eps) or eps < 0.0:
+        raise ValueError("uncertainty_floor must be finite and non-negative.")
+    threshold_sq = float((eps * y_norm) ** 2)
+    residual_scale = max(float(np.sqrt(threshold_sq)), np.finfo(float).tiny)
+
+    blocks_full = baseline + changes
+    blocks = tuple(B[:, atoms] for B in blocks_full)
+    pivot_local = 0  # atoms are sorted; pivot is atoms[0]
+
+    def theta_from_free(x: FloatArray) -> FloatArray:
+        th = np.zeros(len(atoms), dtype=float)
+        th[pivot_local] = 1.0
+        if free_atoms:
+            th[1:] = np.asarray(x, dtype=float)
+        return th
+
+    def solve_amplitudes(theta_active: FloatArray):
+        C = np.column_stack([B @ theta_active for B in blocks])
+        a, _, _, _ = np.linalg.lstsq(C, y, rcond=None)
+        r = np.asarray(y - C @ a, dtype=float)
+        return np.asarray(a, dtype=float), r
+
+    # Local-start set. Basin-hopping proposals can disable the repeatedly used
+    # pivot-only start and relax only from the raw jump.
+    starts: list[FloatArray] = []
+    if include_default_start:
+        starts.append(np.zeros(len(free_atoms), dtype=float))
+    if warm_theta is not None:
+        wt = np.asarray(warm_theta, dtype=float).reshape(-1)
+        if wt.size == L and abs(wt[pivot]) > 1e-14:
+            wt = wt / wt[pivot]
+            starts.append(np.asarray([wt[a] for a in free_atoms], dtype=float))
+    if free_atoms and not starts:
+        raise ValueError(
+            "At least one fixed-dynamics local start is required. Supply "
+            "warm_theta or set include_default_start=True."
+        )
+
+    unique_starts: list[FloatArray] = []
+    for x in starts:
+        if not any(np.allclose(x, z, rtol=0.0, atol=1e-14) for z in unique_starts):
+            unique_starts.append(x)
+
+    best = None
+    total_nfev = 0
+    any_success = False
+    if not free_atoms:
+        theta_active = theta_from_free(np.zeros(0, dtype=float))
+        amplitudes, residual = solve_amplitudes(theta_active)
+        rss = float(residual @ residual)
+        best = (rss, theta_active, amplitudes, residual)
+        any_success = True
+    else:
+        def residual_fun(x: FloatArray) -> FloatArray:
+            th = theta_from_free(x)
+            _, r = solve_amplitudes(th)
+            return r / residual_scale
+
+        for x0 in unique_starts:
+            sol = least_squares(
+                residual_fun,
+                x0,
+                method="trf",
+                x_scale="jac",
+                xtol=1e-12,
+                ftol=1e-12,
+                gtol=1e-12,
+                max_nfev=max(1, int(max_nfev)),
+            )
+            total_nfev += int(sol.nfev)
+            any_success = any_success or bool(sol.success)
+            th = theta_from_free(sol.x)
+            a, r = solve_amplitudes(th)
+            rss = float(r @ r)
+            if best is None or rss < best[0]:
+                best = (rss, th, a, r)
+
+    assert best is not None
+    rss, theta_active, amplitudes, residual = best
+    theta_full = np.zeros(L, dtype=float)
+    theta_full[np.asarray(atoms, dtype=int)] = theta_active
+    rho = float(np.sqrt(max(rss, 0.0)) / y_norm)
+    feasible = bool(rss <= threshold_sq * (1.0 + 100.0 * np.finfo(float).eps))
+
+    if compute_linear_relaxation:
+        A_relaxed = np.hstack(blocks)
+        beta, _, _, _ = np.linalg.lstsq(A_relaxed, y, rcond=None)
+        r_relaxed = np.asarray(y - A_relaxed @ beta, dtype=float)
+        relaxed_rho = float(np.linalg.norm(r_relaxed) / y_norm)
+    else:
+        relaxed_rho = 0.0
+    relaxation_proves_infeasible = bool(
+        compute_linear_relaxation and relaxed_rho > eps * (1.0 + 1e-10)
+    )
+
+    return FixedDynamicsProfile(
+        active_atoms=atoms,
+        pivot_atom=pivot,
+        theta=theta_full,
+        amplitudes=np.asarray(amplitudes, dtype=float),
+        residual=np.asarray(residual, dtype=float),
+        residual_sq=float(rss),
+        relative_residual=rho,
+        feasible_witness=feasible,
+        relaxed_relative_residual=relaxed_rho,
+        relaxation_proves_infeasible=relaxation_proves_infeasible,
+        y_norm=y_norm,
+        uncertainty_floor=eps,
+        threshold_sq=threshold_sq,
+        n_baseline_amplitudes=len(baseline),
+        n_change_amplitudes=len(changes),
+        optimizer_nfev=int(total_nfev),
+        optimizer_success=bool(any_success),
+    )
+
+
+def _fixed_dynamics_coordinate_descent_quantized(
+    profile: FixedDynamicsProfile,
+    baseline_blocks: Sequence[FloatArray],
+    change_blocks: Sequence[FloatArray],
+    quantizer: UniformDyadicQuantizer,
+    q: int,
+    *,
+    max_passes: int = 8,
+) -> tuple[FloatArray, FloatArray, float, int]:
+    """Local lattice optimization for the fixed-dynamics gauge coordinates."""
+
+    y_dummy = np.zeros(profile.residual.size, dtype=float)
+    _, baseline, changes, L = _validate_fixed_dynamics_blocks(
+        y_dummy, baseline_blocks, change_blocks
+    )
+    blocks_full = baseline + changes
+    atoms = profile.active_atoms
+    blocks = tuple(B[:, atoms] for B in blocks_full)
+    pivot_local = 0
+    free_local = tuple(range(1, len(atoms)))
+
+    # Reconstruct y from the continuous profile and its residual.  Since
+    # residual = y - prediction, this avoids storing y inside the profile.
+    theta_active0 = profile.theta[np.asarray(atoms, dtype=int)]
+    y = _fixed_dynamics_prediction(blocks, profile.amplitudes, theta_active0) + profile.residual
+
+    a = quantizer.quantize(profile.amplitudes, q)
+    theta_active = theta_active0.copy()
+    if free_local:
+        theta_active[1:] = quantizer.quantize(theta_active0[1:], q)
+    theta_active[pivot_local] = 1.0
+
+    pred = _fixed_dynamics_prediction(blocks, a, theta_active)
+    r = np.asarray(y - pred, dtype=float)
+    step = quantizer.step(q)
+    lo, hi = quantizer.integer_limits(q)
+
+    passes_done = 0
+    for p in range(max(0, int(max_passes))):
+        improved = False
+
+        # Scalar amplitudes: exact 1D quadratic conditional update.
+        for i, B in enumerate(blocks):
+            v = B @ theta_active
+            vv = float(v @ v)
+            if vv <= np.finfo(float).tiny:
+                continue
+            target = float(a[i] + (v @ r) / vv)
+            k0 = int(np.rint(target / step))
+            best_val = float(a[i])
+            best_delta = 0.0
+            rv = float(r @ v)
+            for k in (k0 - 1, k0, k0 + 1):
+                if k < lo or k > hi:
+                    continue
+                val = float(k * step)
+                d = val - a[i]
+                if d == 0.0:
+                    continue
+                delta = -2.0 * d * rv + d * d * vv
+                if delta < best_delta:
+                    best_delta = float(delta)
+                    best_val = val
+            if best_val != a[i]:
+                d = best_val - a[i]
+                a[i] = best_val
+                r = r - d * v
+                improved = True
+
+        # Shared-law coefficients except the fixed gauge pivot.
+        for j in free_local:
+            v = np.zeros_like(r)
+            for ai, B in zip(a, blocks):
+                v += float(ai) * B[:, j]
+            vv = float(v @ v)
+            if vv <= np.finfo(float).tiny:
+                continue
+            target = float(theta_active[j] + (v @ r) / vv)
+            k0 = int(np.rint(target / step))
+            best_val = float(theta_active[j])
+            best_delta = 0.0
+            rv = float(r @ v)
+            for k in (k0 - 1, k0, k0 + 1):
+                if k < lo or k > hi:
+                    continue
+                val = float(k * step)
+                d = val - theta_active[j]
+                if d == 0.0:
+                    continue
+                delta = -2.0 * d * rv + d * d * vv
+                if delta < best_delta:
+                    best_delta = float(delta)
+                    best_val = val
+            if best_val != theta_active[j]:
+                d = best_val - theta_active[j]
+                theta_active[j] = best_val
+                r = r - d * v
+                improved = True
+
+        passes_done = p + 1
+        if not improved:
+            break
+
+    theta_full = np.zeros(L, dtype=float)
+    theta_full[np.asarray(atoms, dtype=int)] = theta_active
+    rss = float(r @ r)
+    return theta_full, np.asarray(a, dtype=float), rss, passes_done
+
+
+def fixed_dynamics_quantized_witness(
+    profile: FixedDynamicsProfile,
+    baseline_blocks: Sequence[FloatArray],
+    change_blocks: Sequence[FloatArray],
+    *,
+    q: int,
+    quantizer: UniformDyadicQuantizer,
+    max_coordinate_passes: int = 8,
+) -> FixedDynamicsQuantizedWitness:
+    q = int(q)
+    if q < 1:
+        raise ValueError("q must be >= 1.")
+    if not profile.feasible_witness:
+        return FixedDynamicsQuantizedWitness(
+            q=q,
+            theta=profile.theta.copy(),
+            amplitudes=profile.amplitudes.copy(),
+            relative_residual=np.inf,
+            residual_sq=np.inf,
+            feasible=False,
+            coordinate_passes=0,
+        )
+    theta, amplitudes, rss, passes = _fixed_dynamics_coordinate_descent_quantized(
+        profile,
+        baseline_blocks,
+        change_blocks,
+        quantizer,
+        q,
+        max_passes=max_coordinate_passes,
+    )
+    rho = float(np.sqrt(max(rss, 0.0)) / profile.y_norm)
+    feasible = bool(rss <= profile.threshold_sq * (1.0 + 100.0 * np.finfo(float).eps))
+    return FixedDynamicsQuantizedWitness(
+        q=q,
+        theta=theta,
+        amplitudes=amplitudes,
+        relative_residual=rho,
+        residual_sq=float(rss),
+        feasible=feasible,
+        coordinate_passes=int(passes),
+    )
+
+
+def profile_fixed_dynamics_precision_witness(
+    profile: FixedDynamicsProfile,
+    baseline_blocks: Sequence[FloatArray],
+    change_blocks: Sequence[FloatArray],
+    *,
+    quantizer: UniformDyadicQuantizer,
+    q_min: int = 1,
+    q_max: int = 64,
+    warm_q: Optional[int] = None,
+    max_coordinate_passes: int = 8,
+) -> FixedDynamicsPrecisionProfile:
+    """Find the first feasible q-bit witness for a fixed-dynamics profile.
+
+    As in the linear reference profiler, this is an upper bound on q_star, not
+    a minimality certificate.
+    """
+
+    q_min, q_max = int(q_min), int(q_max)
+    if q_min < 1 or q_max < q_min:
+        raise ValueError("Require 1 <= q_min <= q_max.")
+    if not profile.feasible_witness:
+        return FixedDynamicsPrecisionProfile(None, None, tuple(), False, quantizer)
+
+    order = list(range(q_min, q_max + 1))
+    # We still test all lower q before claiming the first witness, but trying the
+    # warm q first can cheaply establish an upper bound used by later screening.
+    warm_result = None
+    if warm_q is not None and q_min <= int(warm_q) <= q_max:
+        warm_result = fixed_dynamics_quantized_witness(
+            profile,
+            baseline_blocks,
+            change_blocks,
+            q=int(warm_q),
+            quantizer=quantizer,
+            max_coordinate_passes=max_coordinate_passes,
+        )
+
+    tested = []
+    found = None
+    upper_limit = q_max if warm_result is None or not warm_result.feasible else int(warm_q)
+    for q in range(q_min, upper_limit + 1):
+        if warm_result is not None and q == int(warm_q):
+            w = warm_result
+        else:
+            w = fixed_dynamics_quantized_witness(
+                profile,
+                baseline_blocks,
+                change_blocks,
+                q=q,
+                quantizer=quantizer,
+                max_coordinate_passes=max_coordinate_passes,
+            )
+        tested.append(q)
+        if w.feasible:
+            found = w
+            break
+
+    return FixedDynamicsPrecisionProfile(
+        q_upper=None if found is None else int(found.q),
+        witness=found,
+        tested_q=tuple(tested),
+        certified_exact=False,
+        quantizer=quantizer,
+    )
+
+
+@dataclass(frozen=True)
+class FixedDynamicsVarProWorkspace:
+    """Cached fixed-support geometry for repeated shared-law relaxation."""
+
+    y: FloatArray
+    derivative_blocks: FloatArray  # (n_active_atoms, n_rows, n_amplitudes)
+    active_atoms: tuple[int, ...]
+    pivot_atom: int
+    y_norm: float
+    uncertainty_floor: float
+    threshold_sq: float
+    n_baseline_amplitudes: int
+    n_change_amplitudes: int
+    full_library_size: int
+
+    @property
+    def n_amplitudes(self) -> int:
+        return int(self.n_baseline_amplitudes + self.n_change_amplitudes)
+
+
+def build_fixed_dynamics_varpro_workspace(
+    y: FloatArray,
+    baseline_blocks: Sequence[FloatArray],
+    change_blocks: Sequence[FloatArray],
+    *,
+    active_atoms: Sequence[int],
+    uncertainty_floor: float,
+) -> FixedDynamicsVarProWorkspace:
+    """Precompute the repeated block geometry used by variable projection."""
+
+    y, baseline, changes, L = _validate_fixed_dynamics_blocks(
+        y, baseline_blocks, change_blocks
+    )
+    atoms = tuple(sorted(set(int(a) for a in active_atoms)))
+    if not atoms:
+        raise ValueError("active_atoms must be non-empty.")
+    if any(a < 0 or a >= L for a in atoms):
+        raise ValueError("active_atoms contains an out-of-range atom index.")
+    blocks = baseline + changes
     D = np.stack(
         [np.column_stack([B[:, atom] for B in blocks]) for atom in atoms],
         axis=0,
@@ -568,20 +968,7 @@ def build_fixed_dynamics_varpro_workspace(
     if y_norm <= np.finfo(float).tiny:
         raise ValueError("y must have nonzero norm.")
     eps = float(uncertainty_floor)
-    if not np.isfinite(eps) or eps < 0.0:
-        raise ValueError("uncertainty_floor must be finite and non-negative.")
     threshold_sq = float((eps * y_norm) ** 2)
-
-    if compute_linear_relaxation:
-        A_relaxed = np.hstack([B[:, np.asarray(atoms, dtype=int)] for B in blocks])
-        beta, _, _, _ = np.linalg.lstsq(A_relaxed, y, rcond=None)
-        r_relaxed = np.asarray(y - A_relaxed @ beta, dtype=float)
-        relaxed_rho = float(np.linalg.norm(r_relaxed) / y_norm)
-        relaxation_infeasible = bool(relaxed_rho > eps * (1.0 + 1e-10))
-    else:
-        relaxed_rho = 0.0
-        relaxation_infeasible = False
-
     return FixedDynamicsVarProWorkspace(
         y=np.asarray(y, dtype=float),
         derivative_blocks=np.asarray(D, dtype=float),
@@ -590,9 +977,9 @@ def build_fixed_dynamics_varpro_workspace(
         y_norm=y_norm,
         uncertainty_floor=eps,
         threshold_sq=threshold_sq,
+        n_baseline_amplitudes=len(baseline),
+        n_change_amplitudes=len(changes),
         full_library_size=L,
-        relaxed_relative_residual=float(relaxed_rho),
-        relaxation_proves_infeasible=bool(relaxation_infeasible),
     )
 
 
@@ -603,7 +990,12 @@ def profile_fixed_dynamics_varpro(
     max_nfev: int = 80,
     include_default_start: bool = True,
 ) -> FixedDynamicsProfile:
-    """Locally minimize E(Theta)=min_W rho using exact variable projection."""
+    """Locally relax a shared law using the exact variable-projection Jacobian.
+
+    This changes only the numerical implementation of the same profiled
+    least-squares objective.  Structural amplitudes are eliminated exactly at
+    every law evaluation.
+    """
 
     from scipy.optimize import least_squares
 
@@ -611,7 +1003,10 @@ def profile_fixed_dynamics_varpro(
     d = len(atoms)
     y = workspace.y
     D = workspace.derivative_blocks
-    scale = max(workspace.uncertainty_floor * workspace.y_norm, np.finfo(float).tiny)
+    scale = max(
+        workspace.uncertainty_floor * workspace.y_norm,
+        np.finfo(float).tiny,
+    )
 
     def theta_active_from_x(x: FloatArray) -> FloatArray:
         th = np.zeros(d, dtype=float)
@@ -622,7 +1017,7 @@ def profile_fixed_dynamics_varpro(
 
     def compute_state(x: FloatArray, need_jac: bool):
         tha = theta_active_from_x(x)
-        C = np.tensordot(tha, D, axes=(0, 0))  # (rows, amplitudes)
+        C = np.tensordot(tha, D, axes=(0, 0))
         U, sv, Vt = np.linalg.svd(C, full_matrices=False)
         if sv.size:
             tol = np.finfo(float).eps * max(C.shape) * float(sv[0])
@@ -638,15 +1033,14 @@ def profile_fixed_dynamics_varpro(
             r = np.asarray(y - Ur @ uy, dtype=float)
         else:
             amp = np.zeros(C.shape[1], dtype=float)
-            r = y.copy()
+            r = np.asarray(y, dtype=float).copy()
         if not need_jac or d <= 1:
             return tha, amp, r, None
-
         Df = D[1:, :, :]
-        vdir = np.einsum("jra,a->rj", Df, amp, optimize=True)
+        vdir = np.einsum('jra,a->rj', Df, amp, optimize=True)
         if sr.size:
             term1 = -(vdir - Ur @ (Ur.T @ vdir))
-            b = np.einsum("jra,r->aj", Df, r, optimize=True)
+            b = np.einsum('jra,r->aj', Df, r, optimize=True)
             term2 = -Ur @ ((Vr.T @ b) / sr[:, None])
             jac = term1 + term2
         else:
@@ -661,9 +1055,10 @@ def profile_fixed_dynamics_varpro(
         if wt.size != workspace.full_library_size:
             raise ValueError("warm_theta has the wrong library dimension.")
         pv = float(wt[workspace.pivot_atom])
-        if abs(pv) > 1e-14:
-            wt = wt / pv
-            starts.append(np.asarray([wt[a] for a in atoms[1:]], dtype=float))
+        if abs(pv) <= 1e-14:
+            raise ValueError("warm_theta has zero gauge-pivot coefficient.")
+        wt = wt / pv
+        starts.append(np.asarray([wt[a] for a in atoms[1:]], dtype=float))
     if d > 1 and not starts:
         raise ValueError("A local start is required.")
 
@@ -683,7 +1078,6 @@ def profile_fixed_dynamics_varpro(
         for x0 in unique:
             cache_x = None
             cache_state = None
-
             def cached(x: FloatArray):
                 nonlocal cache_x, cache_state
                 xx = np.asarray(x, dtype=float)
@@ -691,16 +1085,13 @@ def profile_fixed_dynamics_varpro(
                     cache_x = xx.copy()
                     cache_state = compute_state(xx, True)
                 return cache_state
-
+            def fun(x: FloatArray) -> FloatArray:
+                return cached(x)[2] / scale
+            def jac(x: FloatArray) -> FloatArray:
+                return cached(x)[3] / scale
             sol = least_squares(
-                lambda x: cached(x)[2] / scale,
-                x0,
-                jac=lambda x: cached(x)[3] / scale,
-                method="trf",
-                x_scale="jac",
-                xtol=1e-12,
-                ftol=1e-12,
-                gtol=1e-12,
+                fun, x0, jac=jac, method='trf', x_scale='jac',
+                xtol=1e-12, ftol=1e-12, gtol=1e-12,
                 max_nfev=max(1, int(max_nfev)),
             )
             total_nfev += int(sol.nfev)
@@ -715,8 +1106,9 @@ def profile_fixed_dynamics_varpro(
     theta = np.zeros(workspace.full_library_size, dtype=float)
     theta[np.asarray(atoms, dtype=int)] = tha
     rho = float(np.sqrt(max(rss, 0.0)) / workspace.y_norm)
-    feasible = bool(rss <= workspace.threshold_sq * (1.0 + 100.0 * np.finfo(float).eps))
-
+    feasible = bool(
+        rss <= workspace.threshold_sq * (1.0 + 100.0 * np.finfo(float).eps)
+    )
     return FixedDynamicsProfile(
         active_atoms=atoms,
         pivot_atom=workspace.pivot_atom,
@@ -726,201 +1118,15 @@ def profile_fixed_dynamics_varpro(
         residual_sq=rss,
         relative_residual=rho,
         feasible_witness=feasible,
-        relaxed_relative_residual=workspace.relaxed_relative_residual,
-        relaxation_proves_infeasible=workspace.relaxation_proves_infeasible,
+        relaxed_relative_residual=0.0,
+        relaxation_proves_infeasible=False,
         y_norm=workspace.y_norm,
         uncertainty_floor=workspace.uncertainty_floor,
         threshold_sq=workspace.threshold_sq,
+        n_baseline_amplitudes=workspace.n_baseline_amplitudes,
+        n_change_amplitudes=workspace.n_change_amplitudes,
         optimizer_nfev=int(total_nfev),
         optimizer_success=bool(any_success),
-    )
-
-
-def profile_fixed_dynamics(
-    y: FloatArray,
-    structural_blocks: Sequence[FloatArray],
-    *,
-    active_atoms: Sequence[int],
-    uncertainty_floor: float,
-    warm_theta: Optional[FloatArray] = None,
-    max_nfev: int = 250,
-    compute_linear_relaxation: bool = True,
-    include_default_start: bool = True,
-) -> FixedDynamicsProfile:
-    workspace = build_fixed_dynamics_varpro_workspace(
-        y,
-        structural_blocks,
-        active_atoms=active_atoms,
-        uncertainty_floor=uncertainty_floor,
-        compute_linear_relaxation=compute_linear_relaxation,
-    )
-    return profile_fixed_dynamics_varpro(
-        workspace,
-        warm_theta=warm_theta,
-        max_nfev=max_nfev,
-        include_default_start=include_default_start,
-    )
-
-
-def _fixed_dynamics_coordinate_descent_quantized(
-    profile: FixedDynamicsProfile,
-    structural_blocks: Sequence[FloatArray],
-    quantizer: UniformDyadicQuantizer,
-    q: int,
-    *,
-    max_passes: int = 8,
-) -> tuple[FloatArray, FloatArray, float, int]:
-    y_dummy = np.zeros(profile.residual.size, dtype=float)
-    _, blocks, L = _validate_fixed_dynamics_blocks(y_dummy, structural_blocks)
-    atoms = profile.active_atoms
-    local_blocks = tuple(B[:, np.asarray(atoms, dtype=int)] for B in blocks)
-    theta0 = profile.theta[np.asarray(atoms, dtype=int)]
-    y = _fixed_dynamics_prediction(local_blocks, profile.amplitudes, theta0) + profile.residual
-
-    a = quantizer.quantize(profile.amplitudes, q)
-    theta = theta0.copy()
-    if len(atoms) > 1:
-        theta[1:] = quantizer.quantize(theta0[1:], q)
-    theta[0] = 1.0
-
-    pred = _fixed_dynamics_prediction(local_blocks, a, theta)
-    r = np.asarray(y - pred, dtype=float)
-    step = quantizer.step(q)
-    lo, hi = quantizer.integer_limits(q)
-
-    passes_done = 0
-    for p in range(max(0, int(max_passes))):
-        improved = False
-        for i, B in enumerate(local_blocks):
-            v = B @ theta
-            vv = float(v @ v)
-            if vv <= np.finfo(float).tiny:
-                continue
-            target = float(a[i] + (v @ r) / vv)
-            k0 = int(np.rint(target / step))
-            best_val, best_delta = float(a[i]), 0.0
-            rv = float(r @ v)
-            for k in (k0 - 1, k0, k0 + 1):
-                if lo <= k <= hi:
-                    val = float(k * step)
-                    dlt = val - a[i]
-                    delta = -2.0 * dlt * rv + dlt * dlt * vv
-                    if delta < best_delta:
-                        best_val, best_delta = val, float(delta)
-            if best_val != a[i]:
-                dlt = best_val - a[i]
-                a[i] = best_val
-                r = r - dlt * v
-                improved = True
-
-        for j in range(1, len(atoms)):
-            v = np.zeros_like(r)
-            for ai, B in zip(a, local_blocks):
-                v += float(ai) * B[:, j]
-            vv = float(v @ v)
-            if vv <= np.finfo(float).tiny:
-                continue
-            target = float(theta[j] + (v @ r) / vv)
-            k0 = int(np.rint(target / step))
-            best_val, best_delta = float(theta[j]), 0.0
-            rv = float(r @ v)
-            for k in (k0 - 1, k0, k0 + 1):
-                if lo <= k <= hi:
-                    val = float(k * step)
-                    dlt = val - theta[j]
-                    delta = -2.0 * dlt * rv + dlt * dlt * vv
-                    if delta < best_delta:
-                        best_val, best_delta = val, float(delta)
-            if best_val != theta[j]:
-                dlt = best_val - theta[j]
-                theta[j] = best_val
-                r = r - dlt * v
-                improved = True
-
-        passes_done = p + 1
-        if not improved:
-            break
-
-    theta_full = np.zeros(L, dtype=float)
-    theta_full[np.asarray(atoms, dtype=int)] = theta
-    return theta_full, np.asarray(a, dtype=float), float(r @ r), passes_done
-
-
-def fixed_dynamics_quantized_witness(
-    profile: FixedDynamicsProfile,
-    structural_blocks: Sequence[FloatArray],
-    *,
-    q: int,
-    quantizer: UniformDyadicQuantizer,
-    max_coordinate_passes: int = 8,
-) -> FixedDynamicsQuantizedWitness:
-    q = int(q)
-    if q < 1:
-        raise ValueError("q must be >= 1.")
-    if not profile.feasible_witness:
-        return FixedDynamicsQuantizedWitness(
-            q, profile.theta.copy(), profile.amplitudes.copy(), np.inf, np.inf, False, 0
-        )
-    theta, amplitudes, rss, passes = _fixed_dynamics_coordinate_descent_quantized(
-        profile,
-        structural_blocks,
-        quantizer,
-        q,
-        max_passes=max_coordinate_passes,
-    )
-    rho = float(np.sqrt(max(rss, 0.0)) / profile.y_norm)
-    feasible = bool(rss <= profile.threshold_sq * (1.0 + 100.0 * np.finfo(float).eps))
-    return FixedDynamicsQuantizedWitness(
-        q, theta, amplitudes, rho, float(rss), feasible, int(passes)
-    )
-
-
-def profile_fixed_dynamics_precision_witness(
-    profile: FixedDynamicsProfile,
-    structural_blocks: Sequence[FloatArray],
-    *,
-    quantizer: UniformDyadicQuantizer,
-    q_min: int = 1,
-    q_max: int = 64,
-    warm_q: Optional[int] = None,
-    max_coordinate_passes: int = 8,
-) -> FixedDynamicsPrecisionProfile:
-    q_min, q_max = int(q_min), int(q_max)
-    if q_min < 1 or q_max < q_min:
-        raise ValueError("Require 1 <= q_min <= q_max.")
-    if not profile.feasible_witness:
-        return FixedDynamicsPrecisionProfile(None, None, tuple(), False, quantizer)
-
-    warm = None
-    if warm_q is not None and q_min <= int(warm_q) <= q_max:
-        warm = fixed_dynamics_quantized_witness(
-            profile,
-            structural_blocks,
-            q=int(warm_q),
-            quantizer=quantizer,
-            max_coordinate_passes=max_coordinate_passes,
-        )
-    upper = q_max if warm is None or not warm.feasible else int(warm_q)
-    tested: list[int] = []
-    found = None
-    for q in range(q_min, upper + 1):
-        w = warm if warm is not None and q == int(warm_q) else fixed_dynamics_quantized_witness(
-            profile,
-            structural_blocks,
-            q=q,
-            quantizer=quantizer,
-            max_coordinate_passes=max_coordinate_passes,
-        )
-        tested.append(q)
-        if w.feasible:
-            found = w
-            break
-    return FixedDynamicsPrecisionProfile(
-        None if found is None else int(found.q),
-        found,
-        tuple(tested),
-        False,
-        quantizer,
     )
 
 
@@ -936,10 +1142,10 @@ __all__ = [
     "FixedDynamicsProfile",
     "FixedDynamicsQuantizedWitness",
     "FixedDynamicsPrecisionProfile",
+    "profile_fixed_dynamics",
     "FixedDynamicsVarProWorkspace",
     "build_fixed_dynamics_varpro_workspace",
     "profile_fixed_dynamics_varpro",
-    "profile_fixed_dynamics",
     "fixed_dynamics_quantized_witness",
     "profile_fixed_dynamics_precision_witness",
 ]

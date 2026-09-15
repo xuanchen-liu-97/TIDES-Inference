@@ -46,6 +46,9 @@ from mdl_precision import (
     FixedDynamicsPrecisionProfile,
     profile_fixed_dynamics,
     profile_fixed_dynamics_precision_witness,
+    FixedDynamicsVarProWorkspace,
+    build_fixed_dynamics_varpro_workspace,
+    profile_fixed_dynamics_varpro,
 )
 
 
@@ -875,6 +878,7 @@ def profile_fixed_dynamics_candidate(
     warm_theta: Optional[FloatArray] = None,
     max_nfev: int = 250,
     compute_linear_relaxation: bool = True,
+    include_default_start: bool = True,
 ) -> FixedDynamicsProfile:
     groups = _fd_normalise_groups(problem, active_groups)
     atoms = _fd_normalise_atoms(problem, active_atoms)
@@ -887,6 +891,7 @@ def profile_fixed_dynamics_candidate(
         warm_theta=warm_theta,
         max_nfev=max_nfev,
         compute_linear_relaxation=compute_linear_relaxation,
+        include_default_start=include_default_start,
     )
 
 
@@ -1229,6 +1234,184 @@ def evaluate_fixed_dynamics_move(
     )
 
 
+
+@dataclass(frozen=True)
+class SharedLawBasinHopStep:
+    """One basin-to-basin proposal in the profiled shared-law landscape."""
+
+    iteration: int
+    block_size: int
+    sigma: float
+    perturbed_atoms: tuple[int, ...]
+    raw_theta: FloatArray
+    relaxed_theta: FloatArray
+    proposed_relative_residual: float
+    accepted: bool
+    best_relative_residual: float
+    optimizer_nfev: int
+
+
+@dataclass(frozen=True)
+class SharedLawBasinSearchResult:
+    """Outcome of monotone multiscale block basin hopping."""
+
+    initial_profile: FixedDynamicsProfile
+    best_profile: FixedDynamicsProfile
+    history: tuple[SharedLawBasinHopStep, ...]
+    reached_floor: bool
+    seed: Optional[int]
+
+    @property
+    def n_hops(self) -> int:
+        return len(self.history)
+
+    @property
+    def n_accepted(self) -> int:
+        return sum(int(h.accepted) for h in self.history)
+
+
+def discover_fixed_dynamics_shared_law(
+    problem: FixedDynamicsMDLProblem,
+    *,
+    active_groups: Optional[Sequence[GroupLabel]] = None,
+    active_atoms: Optional[Sequence[int]] = None,
+    n_hops: int = 80,
+    sigma_min: float = 5e-3,
+    sigma_max: float = 1.5e-1,
+    min_block_size: int = 1,
+    max_block_size: Optional[int] = None,
+    small_block_probability: float = 0.60,
+    low_degree_bias_power: float = 1.0,
+    local_max_nfev: int = 50,
+    seed: Optional[int] = None,
+    initial_theta: Optional[FloatArray] = None,
+    improvement_rtol: float = 1e-12,
+) -> SharedLawBasinSearchResult:
+    """Discover a floor-feasible shared law with one simple global idea.
+
+    The structural support and polynomial library are held fixed during this
+    phase.  At each iteration we (i) draw one random block of free shared-law
+    coefficients (small and low-degree blocks are proposed more often), (ii)
+    perturb that block with one log-uniform step scale, (iii) locally relax the
+    raw proposal by variable projection, and (iv) keep
+    the resulting basin only when its profiled residual is lower.
+
+    There is no annealing, parallel tempering, HMC, or population method here.
+    Escape from a metastable basin is provided only by the nonlocal raw jump.
+    The analytic variable-projection Jacobian is a numerical acceleration, not
+    an additional optimization principle.
+    """
+
+    groups = _fd_normalise_groups(
+        problem, problem.groups if active_groups is None else active_groups
+    )
+    atoms = _fd_normalise_atoms(
+        problem,
+        tuple(range(problem.library.n_atoms))
+        if active_atoms is None
+        else active_atoms,
+    )
+    free_atoms = tuple(a for a in atoms if a != atoms[0])
+    if n_hops < 0:
+        raise ValueError("n_hops must be non-negative.")
+    if not (0.0 < sigma_min <= sigma_max):
+        raise ValueError("Require 0 < sigma_min <= sigma_max.")
+
+    workspace = build_fixed_dynamics_varpro_workspace(
+        problem.y,
+        problem.baseline_blocks,
+        _fd_change_blocks(problem, groups),
+        active_atoms=atoms,
+        uncertainty_floor=problem.uncertainty_floor,
+    )
+
+    initial = profile_fixed_dynamics_varpro(
+        workspace,
+        warm_theta=initial_theta,
+        max_nfev=local_max_nfev,
+        include_default_start=True,
+    )
+    if initial.feasible_witness or not free_atoms:
+        return SharedLawBasinSearchResult(
+            initial, initial, tuple(), bool(initial.feasible_witness), seed
+        )
+
+    d = len(free_atoms)
+    kmin = max(1, int(min_block_size))
+    kmax = d if max_block_size is None else min(d, int(max_block_size))
+    if kmin > kmax:
+        raise ValueError("Invalid block-size range.")
+    p_small = float(small_block_probability)
+    if not (0.0 < p_small <= 1.0):
+        raise ValueError("small_block_probability must lie in (0,1].")
+    degree_power = float(low_degree_bias_power)
+    if degree_power < 0.0 or not np.isfinite(degree_power):
+        raise ValueError("low_degree_bias_power must be finite and non-negative.")
+
+    rng = np.random.default_rng(seed)
+    best = initial
+    history: list[SharedLawBasinHopStep] = []
+    log_lo = np.log(float(sigma_min))
+    log_hi = np.log(float(sigma_max))
+    free_arr = np.asarray(free_atoms, dtype=int)
+    degrees = np.asarray(
+        [problem.library.atom_degrees[a] for a in free_atoms], dtype=float
+    )
+    atom_prob = degrees ** (-degree_power)
+    atom_prob = atom_prob / atom_prob.sum()
+
+    for it in range(int(n_hops)):
+        # Geometric block size: single/small groups dominate, while the tail
+        # still gives nonzero probability to genuinely nonlocal group jumps.
+        k = kmin - 1 + int(rng.geometric(p_small))
+        k = min(max(k, kmin), kmax)
+        chosen = tuple(
+            int(x)
+            for x in rng.choice(
+                free_arr, size=k, replace=False, p=atom_prob
+            )
+        )
+        sigma = float(np.exp(rng.uniform(log_lo, log_hi)))
+        raw = np.asarray(best.theta, dtype=float).copy()
+        raw[np.asarray(chosen, dtype=int)] += sigma * rng.normal(size=k)
+        raw[best.pivot_atom] = 1.0
+
+        candidate = profile_fixed_dynamics_varpro(
+            workspace,
+            warm_theta=raw,
+            max_nfev=local_max_nfev,
+            include_default_start=False,
+        )
+        threshold = best.relative_residual * (1.0 - float(improvement_rtol))
+        accepted = bool(candidate.relative_residual < threshold)
+        if accepted:
+            best = candidate
+
+        history.append(
+            SharedLawBasinHopStep(
+                iteration=it,
+                block_size=k,
+                sigma=sigma,
+                perturbed_atoms=tuple(sorted(chosen)),
+                raw_theta=np.asarray(raw, dtype=float),
+                relaxed_theta=np.asarray(candidate.theta, dtype=float),
+                proposed_relative_residual=float(candidate.relative_residual),
+                accepted=accepted,
+                best_relative_residual=float(best.relative_residual),
+                optimizer_nfev=int(candidate.optimizer_nfev),
+            )
+        )
+        if best.feasible_witness:
+            break
+
+    return SharedLawBasinSearchResult(
+        initial_profile=initial,
+        best_profile=best,
+        history=tuple(history),
+        reached_floor=bool(best.feasible_witness),
+        seed=seed,
+    )
+
 def run_one_fixed_dynamics_sweep(
     problem: FixedDynamicsMDLProblem,
     state: FixedDynamicsSearchState,
@@ -1290,4 +1473,7 @@ __all__ = [
     "rank_fixed_dynamics_atom_adds",
     "evaluate_fixed_dynamics_move",
     "run_one_fixed_dynamics_sweep",
+    "SharedLawBasinHopStep",
+    "SharedLawBasinSearchResult",
+    "discover_fixed_dynamics_shared_law",
 ]

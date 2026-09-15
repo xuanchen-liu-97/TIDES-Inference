@@ -555,6 +555,7 @@ def profile_fixed_dynamics(
     warm_theta: Optional[FloatArray] = None,
     max_nfev: int = 250,
     compute_linear_relaxation: bool = True,
+    include_default_start: bool = True,
 ) -> FixedDynamicsProfile:
     """Profile a fixed-dynamics model by variable projection.
 
@@ -608,14 +609,21 @@ def profile_fixed_dynamics(
         r = np.asarray(y - C @ a, dtype=float)
         return np.asarray(a, dtype=float), r
 
-    # Deterministic starts: low-order/pivot-only plus a warm shared law when the
-    # previous search state supplies one.  Duplicate starts are removed.
-    starts: list[FloatArray] = [np.zeros(len(free_atoms), dtype=float)]
+    # Local-start set. Basin-hopping proposals can disable the repeatedly used
+    # pivot-only start and relax only from the raw jump.
+    starts: list[FloatArray] = []
+    if include_default_start:
+        starts.append(np.zeros(len(free_atoms), dtype=float))
     if warm_theta is not None:
         wt = np.asarray(warm_theta, dtype=float).reshape(-1)
         if wt.size == L and abs(wt[pivot]) > 1e-14:
             wt = wt / wt[pivot]
             starts.append(np.asarray([wt[a] for a in free_atoms], dtype=float))
+    if free_atoms and not starts:
+        raise ValueError(
+            "At least one fixed-dynamics local start is required. Supply "
+            "warm_theta or set include_default_start=True."
+        )
 
     unique_starts: list[FloatArray] = []
     for x in starts:
@@ -913,6 +921,215 @@ def profile_fixed_dynamics_precision_witness(
     )
 
 
+@dataclass(frozen=True)
+class FixedDynamicsVarProWorkspace:
+    """Cached fixed-support geometry for repeated shared-law relaxation."""
+
+    y: FloatArray
+    derivative_blocks: FloatArray  # (n_active_atoms, n_rows, n_amplitudes)
+    active_atoms: tuple[int, ...]
+    pivot_atom: int
+    y_norm: float
+    uncertainty_floor: float
+    threshold_sq: float
+    n_baseline_amplitudes: int
+    n_change_amplitudes: int
+    full_library_size: int
+
+    @property
+    def n_amplitudes(self) -> int:
+        return int(self.n_baseline_amplitudes + self.n_change_amplitudes)
+
+
+def build_fixed_dynamics_varpro_workspace(
+    y: FloatArray,
+    baseline_blocks: Sequence[FloatArray],
+    change_blocks: Sequence[FloatArray],
+    *,
+    active_atoms: Sequence[int],
+    uncertainty_floor: float,
+) -> FixedDynamicsVarProWorkspace:
+    """Precompute the repeated block geometry used by variable projection."""
+
+    y, baseline, changes, L = _validate_fixed_dynamics_blocks(
+        y, baseline_blocks, change_blocks
+    )
+    atoms = tuple(sorted(set(int(a) for a in active_atoms)))
+    if not atoms:
+        raise ValueError("active_atoms must be non-empty.")
+    if any(a < 0 or a >= L for a in atoms):
+        raise ValueError("active_atoms contains an out-of-range atom index.")
+    blocks = baseline + changes
+    D = np.stack(
+        [np.column_stack([B[:, atom] for B in blocks]) for atom in atoms],
+        axis=0,
+    )
+    y_norm = float(np.linalg.norm(y))
+    if y_norm <= np.finfo(float).tiny:
+        raise ValueError("y must have nonzero norm.")
+    eps = float(uncertainty_floor)
+    threshold_sq = float((eps * y_norm) ** 2)
+    return FixedDynamicsVarProWorkspace(
+        y=np.asarray(y, dtype=float),
+        derivative_blocks=np.asarray(D, dtype=float),
+        active_atoms=atoms,
+        pivot_atom=int(atoms[0]),
+        y_norm=y_norm,
+        uncertainty_floor=eps,
+        threshold_sq=threshold_sq,
+        n_baseline_amplitudes=len(baseline),
+        n_change_amplitudes=len(changes),
+        full_library_size=L,
+    )
+
+
+def profile_fixed_dynamics_varpro(
+    workspace: FixedDynamicsVarProWorkspace,
+    *,
+    warm_theta: Optional[FloatArray] = None,
+    max_nfev: int = 80,
+    include_default_start: bool = True,
+) -> FixedDynamicsProfile:
+    """Locally relax a shared law using the exact variable-projection Jacobian.
+
+    This changes only the numerical implementation of the same profiled
+    least-squares objective.  Structural amplitudes are eliminated exactly at
+    every law evaluation.
+    """
+
+    from scipy.optimize import least_squares
+
+    atoms = workspace.active_atoms
+    d = len(atoms)
+    y = workspace.y
+    D = workspace.derivative_blocks
+    scale = max(
+        workspace.uncertainty_floor * workspace.y_norm,
+        np.finfo(float).tiny,
+    )
+
+    def theta_active_from_x(x: FloatArray) -> FloatArray:
+        th = np.zeros(d, dtype=float)
+        th[0] = 1.0
+        if d > 1:
+            th[1:] = np.asarray(x, dtype=float)
+        return th
+
+    def compute_state(x: FloatArray, need_jac: bool):
+        tha = theta_active_from_x(x)
+        C = np.tensordot(tha, D, axes=(0, 0))
+        U, sv, Vt = np.linalg.svd(C, full_matrices=False)
+        if sv.size:
+            tol = np.finfo(float).eps * max(C.shape) * float(sv[0])
+            keep = sv > tol
+        else:
+            keep = np.zeros(0, dtype=bool)
+        Ur = U[:, keep]
+        sr = sv[keep]
+        Vr = Vt[keep, :].T
+        if sr.size:
+            uy = Ur.T @ y
+            amp = Vr @ (uy / sr)
+            r = np.asarray(y - Ur @ uy, dtype=float)
+        else:
+            amp = np.zeros(C.shape[1], dtype=float)
+            r = np.asarray(y, dtype=float).copy()
+        if not need_jac or d <= 1:
+            return tha, amp, r, None
+        Df = D[1:, :, :]
+        vdir = np.einsum('jra,a->rj', Df, amp, optimize=True)
+        if sr.size:
+            term1 = -(vdir - Ur @ (Ur.T @ vdir))
+            b = np.einsum('jra,r->aj', Df, r, optimize=True)
+            term2 = -Ur @ ((Vr.T @ b) / sr[:, None])
+            jac = term1 + term2
+        else:
+            jac = -vdir
+        return tha, amp, r, np.asarray(jac, dtype=float)
+
+    starts: list[FloatArray] = []
+    if include_default_start:
+        starts.append(np.zeros(max(0, d - 1), dtype=float))
+    if warm_theta is not None:
+        wt = np.asarray(warm_theta, dtype=float).reshape(-1)
+        if wt.size != workspace.full_library_size:
+            raise ValueError("warm_theta has the wrong library dimension.")
+        pv = float(wt[workspace.pivot_atom])
+        if abs(pv) <= 1e-14:
+            raise ValueError("warm_theta has zero gauge-pivot coefficient.")
+        wt = wt / pv
+        starts.append(np.asarray([wt[a] for a in atoms[1:]], dtype=float))
+    if d > 1 and not starts:
+        raise ValueError("A local start is required.")
+
+    unique: list[FloatArray] = []
+    for x in starts:
+        if not any(np.allclose(x, z, rtol=0.0, atol=1e-14) for z in unique):
+            unique.append(x)
+
+    best = None
+    total_nfev = 0
+    any_success = False
+    if d == 1:
+        tha, amp, r, _ = compute_state(np.zeros(0), False)
+        best = (float(r @ r), tha, amp, r)
+        any_success = True
+    else:
+        for x0 in unique:
+            cache_x = None
+            cache_state = None
+            def cached(x: FloatArray):
+                nonlocal cache_x, cache_state
+                xx = np.asarray(x, dtype=float)
+                if cache_x is None or not np.array_equal(xx, cache_x):
+                    cache_x = xx.copy()
+                    cache_state = compute_state(xx, True)
+                return cache_state
+            def fun(x: FloatArray) -> FloatArray:
+                return cached(x)[2] / scale
+            def jac(x: FloatArray) -> FloatArray:
+                return cached(x)[3] / scale
+            sol = least_squares(
+                fun, x0, jac=jac, method='trf', x_scale='jac',
+                xtol=1e-12, ftol=1e-12, gtol=1e-12,
+                max_nfev=max(1, int(max_nfev)),
+            )
+            total_nfev += int(sol.nfev)
+            any_success = any_success or bool(sol.success)
+            tha, amp, r, _ = compute_state(sol.x, False)
+            rss = float(r @ r)
+            if best is None or rss < best[0]:
+                best = (rss, tha, amp, r)
+
+    assert best is not None
+    rss, tha, amp, r = best
+    theta = np.zeros(workspace.full_library_size, dtype=float)
+    theta[np.asarray(atoms, dtype=int)] = tha
+    rho = float(np.sqrt(max(rss, 0.0)) / workspace.y_norm)
+    feasible = bool(
+        rss <= workspace.threshold_sq * (1.0 + 100.0 * np.finfo(float).eps)
+    )
+    return FixedDynamicsProfile(
+        active_atoms=atoms,
+        pivot_atom=workspace.pivot_atom,
+        theta=theta,
+        amplitudes=np.asarray(amp, dtype=float),
+        residual=np.asarray(r, dtype=float),
+        residual_sq=rss,
+        relative_residual=rho,
+        feasible_witness=feasible,
+        relaxed_relative_residual=0.0,
+        relaxation_proves_infeasible=False,
+        y_norm=workspace.y_norm,
+        uncertainty_floor=workspace.uncertainty_floor,
+        threshold_sq=workspace.threshold_sq,
+        n_baseline_amplitudes=workspace.n_baseline_amplitudes,
+        n_change_amplitudes=workspace.n_change_amplitudes,
+        optimizer_nfev=int(total_nfev),
+        optimizer_success=bool(any_success),
+    )
+
+
 __all__ = [
     "ContinuousProfile",
     "UniformDyadicQuantizer",
@@ -926,6 +1143,9 @@ __all__ = [
     "FixedDynamicsQuantizedWitness",
     "FixedDynamicsPrecisionProfile",
     "profile_fixed_dynamics",
+    "FixedDynamicsVarProWorkspace",
+    "build_fixed_dynamics_varpro_workspace",
+    "profile_fixed_dynamics_varpro",
     "fixed_dynamics_quantized_witness",
     "profile_fixed_dynamics_precision_witness",
 ]

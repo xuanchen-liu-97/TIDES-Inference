@@ -44,6 +44,13 @@ except ImportError:  # flat-file form
         optimize_fixed_dynamics_mdl_alternating,
     )
 
+try:
+    from .edge_space_operators import temporal_blocks_from_family
+    from .structural_linear_cache import StructuralLinearCache
+except ImportError:
+    from edge_space_operators import temporal_blocks_from_family
+    from structural_linear_cache import StructuralLinearCache
+
 FloatArray = NDArray[np.float64]
 IntArray = NDArray[np.int64]
 
@@ -155,6 +162,8 @@ def build_fixed_dynamics_problem(
     field_family: EdgeSpaceFieldFamily,
     *,
     mdl_library: Optional[InteractionLibraryCode] = None,
+    block_backend: str = "compact",
+    cache_linear_algebra: bool = True,
 ) -> FixedDynamicsMDLProblem:
     """Construct the H_FD Step-3 search problem from the Step-2 family.
 
@@ -164,6 +173,9 @@ def build_fixed_dynamics_problem(
 
     Every candidate edge is available in every block.  No support is inherited
     from Step 2.
+
+    ``block_backend='compact'`` shares edge-local values across temporal groups;
+    ``'dense'`` retains explicit blocks as a reference/compatibility backend.
     """
 
     if not isinstance(field_family, EdgeSpaceFieldFamily):
@@ -179,33 +191,40 @@ def build_fixed_dynamics_problem(
     )
 
     y = np.concatenate([np.asarray(d.y, dtype=float) for d in field_family.designs])
-    stage_rows = [int(d.n_scalar_observations) for d in field_family.designs]
-    stage_edge_blocks = [
-        tuple(_edge_atom_block(d, m) for m in range(M))
-        for d in field_family.designs
-    ]
+    if block_backend == "compact":
+        blocks = temporal_blocks_from_family(field_family)
+        block_of = {g: (0 if g[0] == "baseline" else int(g[1]) + 1) for g in blocks}
+    elif block_backend == "dense":
+        stage_rows = [int(d.n_scalar_observations) for d in field_family.designs]
+        stage_edge_blocks = [
+            tuple(_edge_atom_block(d, m) for m in range(M))
+            for d in field_family.designs
+        ]
 
-    blocks: dict[tuple, FloatArray] = {}
-    block_of: dict[tuple, int] = {}
+        blocks: dict[tuple, FloatArray] = {}
+        block_of: dict[tuple, int] = {}
 
-    # Baseline W^(1): contributes to every stage.
-    for m in range(M):
-        g = ("baseline", m)
-        blocks[g] = np.vstack([stage_edge_blocks[r][m] for r in range(K)])
-        block_of[g] = 0
-
-    # Delta W^(k): contributes to all stages after transition k.
-    for k in range(K - 1):
+        # Baseline W^(1): contributes to every stage.
         for m in range(M):
-            pieces = []
-            for r in range(K):
-                if r <= k:
-                    pieces.append(np.zeros((stage_rows[r], L), dtype=float))
-                else:
-                    pieces.append(stage_edge_blocks[r][m])
-            g = ("transition", k, m)
-            blocks[g] = np.vstack(pieces)
-            block_of[g] = k + 1
+            g = ("baseline", m)
+            blocks[g] = np.vstack([stage_edge_blocks[r][m] for r in range(K)])
+            block_of[g] = 0
+
+        # Delta W^(k): contributes to all stages after transition k.
+        for k in range(K - 1):
+            for m in range(M):
+                pieces = []
+                for r in range(K):
+                    if r <= k:
+                        pieces.append(np.zeros((stage_rows[r], L), dtype=float))
+                    else:
+                        pieces.append(stage_edge_blocks[r][m])
+                g = ("transition", k, m)
+                blocks[g] = np.vstack(pieces)
+                block_of[g] = k + 1
+
+    else:
+        raise ValueError("block_backend must be compact or dense.")
 
     labels = ("baseline",) + tuple(("transition", k + 1) for k in range(K - 1))
     return FixedDynamicsMDLProblem(
@@ -216,6 +235,7 @@ def build_fixed_dynamics_problem(
         structural_block_labels=labels,
         library=library,
         uncertainty_floor=float(field_family.uncertainty_floor),
+        linear_cache=StructuralLinearCache(enabled=cache_linear_algebra),
     )
 
 
@@ -273,6 +293,8 @@ def compress_fixed_dynamics(
     field_family: EdgeSpaceFieldFamily,
     *,
     mdl_library: Optional[InteractionLibraryCode] = None,
+    block_backend: str = "compact",
+    cache_linear_algebra: bool = True,
     quantizer: Optional[UniformDyadicQuantizer] = None,
     quantizer_bound: float = 1.0,
     initial_groups: Optional[Sequence[tuple]] = None,
@@ -313,9 +335,18 @@ def compress_fixed_dynamics(
 
     ``search_strategy="legacy"`` retains the earlier one-move-at-a-time search
     for regression testing.
+
+    Compact blocks are the default. The current structural least-squares
+    matrix is still solved by SVD; this is not an iterative-solver switch.
+    ``cache_linear_algebra`` enables a bounded exact-key column/solve cache;
+    disable it for an otherwise identical numerical reference run. The cache
+    is local to this call and does not change tolerances or solver algorithms.
     """
 
-    problem = build_fixed_dynamics_problem(field_family, mdl_library=mdl_library)
+    problem = build_fixed_dynamics_problem(
+        field_family, mdl_library=mdl_library, block_backend=block_backend,
+        cache_linear_algebra=cache_linear_algebra,
+    )
     if quantizer is None:
         quantizer = UniformDyadicQuantizer(bound=float(quantizer_bound))
 
@@ -445,6 +476,8 @@ def compress_fixed_dynamics(
         active_atoms=tuple(state.active_atoms),
         search_result=search,
         metadata={
+            "block_backend": block_backend,
+            "linear_cache": problem.linear_cache.stats(),
             "step2_minimum_relative_residual": float(field_family.minimum_relative_residual),
             "n_active_structural_groups": int(len(state.active_groups)),
             "n_active_atoms": int(len(state.active_atoms)),

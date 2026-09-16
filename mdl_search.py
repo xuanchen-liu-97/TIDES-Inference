@@ -25,10 +25,17 @@ Theta is therefore an anchor / warm start, never a permanently frozen law.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
 from typing import Callable, Hashable, Mapping, Optional, Sequence
 
 import numpy as np
+
+try:
+    from .edge_space_operators import TemporalEdgeBlock, coerce_block
+    from .structural_linear_cache import StructuralLinearCache
+except ImportError:
+    from edge_space_operators import TemporalEdgeBlock, coerce_block
+    from structural_linear_cache import StructuralLinearCache
 
 try:  # package form
     from .mdl_description_length import (
@@ -108,6 +115,7 @@ class FixedDynamicsMDLProblem:
     library: InteractionLibraryCode
     uncertainty_floor: float
     hypothesis: FixedDynamicsHypothesis = FixedDynamicsHypothesis()
+    linear_cache: StructuralLinearCache = field(default_factory=StructuralLinearCache, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         y = np.asarray(self.y, dtype=float).reshape(-1)
@@ -118,10 +126,10 @@ class FixedDynamicsMDLProblem:
         L = self.library.n_atoms
         blocks = {}
         for g, B0 in self.structural_blocks.items():
-            B = np.asarray(B0, dtype=float)
+            B = coerce_block(B0)
             if B.shape != (y.size, L):
                 raise ValueError(f"group {g!r} has shape {B.shape}; expected {(y.size, L)}.")
-            if not np.all(np.isfinite(B)):
+            if not isinstance(B, TemporalEdgeBlock) and not np.all(np.isfinite(B)):
                 raise ValueError(f"group {g!r} contains non-finite values.")
             if g not in self.structural_block_of_group:
                 raise ValueError(f"group {g!r} lacks a structural block assignment.")
@@ -389,6 +397,7 @@ def profile_fixed_dynamics_candidate(
         max_nfev=max_nfev,
         compute_linear_relaxation=compute_linear_relaxation,
         include_default_start=include_default_start,
+        linear_cache=problem.linear_cache,
     )
 
 
@@ -486,6 +495,7 @@ def discover_fixed_dynamics_shared_law(
         active_atoms=atoms,
         uncertainty_floor=problem.uncertainty_floor,
         compute_linear_relaxation=True,
+        linear_cache=problem.linear_cache,
     )
     initial = profile_fixed_dynamics_varpro(
         workspace,
@@ -595,7 +605,7 @@ def rank_fixed_dynamics_group_drops(problem: FixedDynamicsMDLProblem, state: Fix
     scored = []
     for j, g in enumerate(state.active_groups):
         a = float(state.continuous.amplitudes[j])
-        contribution = a * (problem.structural_blocks[g] @ theta)
+        contribution = a * problem.linear_cache.column(problem.structural_blocks[g], theta)
         rw = r + contribution
         damage = float(rw @ rw - state.continuous.residual_sq)
         scored.append((damage, g))
@@ -608,7 +618,7 @@ def rank_fixed_dynamics_group_adds(problem: FixedDynamicsMDLProblem, state: Fixe
     active = set(state.active_groups)
     selected = _selected_blocks(problem, state.active_groups)
     if selected:
-        C = np.column_stack([B @ theta for B in selected])
+        C = problem.linear_cache.matrix(selected, theta)
         U, s, _ = np.linalg.svd(C, full_matrices=False)
         if s.size:
             tol = max(C.shape) * np.finfo(float).eps * float(s[0])
@@ -622,7 +632,7 @@ def rank_fixed_dynamics_group_adds(problem: FixedDynamicsMDLProblem, state: Fixe
     for g in problem.groups:
         if g in active:
             continue
-        v = problem.structural_blocks[g] @ theta
+        v = problem.linear_cache.column(problem.structural_blocks[g], theta)
         z = v - Qb @ (Qb.T @ v) if Qb.shape[1] else v
         zz = float(z @ z)
         gain = 0.0 if zz <= np.finfo(float).tiny else float((r @ z) ** 2 / zz)
@@ -987,7 +997,12 @@ def _fixed_theta_linear_profile(
             np.zeros(0, dtype=float),
         )
 
-    C = np.column_stack([problem.structural_blocks[g] @ theta for g in gs])
+    blocks = _selected_blocks(problem, gs)
+    key = problem.linear_cache.key('scaled_lstsq', blocks, theta, problem.y)
+    cached = problem.linear_cache.get(key)
+    if cached is not None:
+        return cached
+    C = problem.linear_cache.matrix(blocks, theta)
     scales = np.sqrt(np.mean(C * C, axis=0))
     bad = ~np.isfinite(scales) | (scales <= np.finfo(float).tiny)
     scales[bad] = 1.0
@@ -998,7 +1013,8 @@ def _fixed_theta_linear_profile(
     rss = float(r @ r)
     yn = float(np.linalg.norm(problem.y))
     rho = float(np.sqrt(max(rss, 0.0)) / yn)
-    return beta, r, rss, rho, int(rank), C, Cs, np.asarray(beta_s, dtype=float)
+    result = (beta, r, rss, rho, int(rank), C, Cs, np.asarray(beta_s, dtype=float))
+    return problem.linear_cache.put(key, result)
 
 
 def _fixed_theta_drop_order(

@@ -193,6 +193,10 @@ class StageEdgeSpaceDesign:
     feature_representation: str
     design_mode: str
 
+    # Compact local data retained for Step 3; does not change Step-2 solves.
+    endpoint_features: Optional[FloatArray] = None
+    edge_endpoints: Optional[IntArray] = None
+
 
 def _stage_column_scales(
     D: FloatArray,
@@ -416,6 +420,8 @@ def build_edge_space_stage_designs(
                 n_scalar_observations=int(n_scalar),
                 feature_representation=str(representation),
                 design_mode=str(resolved_mode),
+                endpoint_features=features[ids] if features.ndim == 4 else None,
+                edge_endpoints=np.column_stack(_pair_endpoints_from_incidence(D_arr)) if features.ndim == 4 else None,
             )
         )
 

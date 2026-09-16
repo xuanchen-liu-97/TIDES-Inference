@@ -27,6 +27,19 @@ from typing import Optional, Sequence
 
 import numpy as np
 
+try:
+    from .structural_linear_cache import StructuralLinearCache
+    from .edge_space_operators import (
+        TemporalEdgeBlock, coerce_block, dense_block,
+        derivative_products, full_support_relaxation,
+    )
+except ImportError:
+    from structural_linear_cache import StructuralLinearCache
+    from edge_space_operators import (
+        TemporalEdgeBlock, coerce_block, dense_block,
+        derivative_products, full_support_relaxation,
+    )
+
 FloatArray = np.ndarray
 
 
@@ -481,14 +494,11 @@ class FixedDynamicsPrecisionProfile:
 
 @dataclass(frozen=True)
 class FixedDynamicsVarProWorkspace:
-    """Cached geometry for repeated shared-law variable projection.
-
-    ``derivative_blocks[j,:,a]`` is the observation-space contribution of
-    structural amplitude ``a`` for unit coefficient of active atom ``j``.
-    """
+    """Shared block maps for variable projection, without a derivative tensor."""
 
     y: FloatArray
-    derivative_blocks: FloatArray  # (n_active_atoms, n_rows, n_amplitudes)
+    structural_blocks: tuple  # compact maps or legacy dense arrays; never L x n x p
+    linear_cache: StructuralLinearCache
     active_atoms: tuple[int, ...]
     pivot_atom: int
     y_norm: float
@@ -500,7 +510,7 @@ class FixedDynamicsVarProWorkspace:
 
     @property
     def n_amplitudes(self) -> int:
-        return int(self.derivative_blocks.shape[2])
+        return len(self.structural_blocks)
 
 
 def _validate_fixed_dynamics_blocks(
@@ -510,7 +520,7 @@ def _validate_fixed_dynamics_blocks(
     y = np.asarray(y, dtype=float).reshape(-1)
     if y.size == 0:
         raise ValueError("y must be non-empty.")
-    blocks = tuple(np.asarray(B, dtype=float) for B in structural_blocks)
+    blocks = tuple(coerce_block(B) for B in structural_blocks)
     if not blocks:
         raise ValueError("At least one active structural block is required.")
     if blocks[0].ndim != 2:
@@ -523,7 +533,7 @@ def _validate_fixed_dynamics_blocks(
             raise ValueError(
                 f"structural block {i} has shape {B.shape}; expected {(y.size, L)}."
             )
-        if not np.all(np.isfinite(B)):
+        if not isinstance(B, TemporalEdgeBlock) and not np.all(np.isfinite(B)):
             raise ValueError(f"structural block {i} contains non-finite values.")
     return y, blocks, L
 
@@ -550,6 +560,7 @@ def build_fixed_dynamics_varpro_workspace(
     active_atoms: Sequence[int],
     uncertainty_floor: float,
     compute_linear_relaxation: bool = True,
+    linear_cache: Optional[StructuralLinearCache] = None,
 ) -> FixedDynamicsVarProWorkspace:
     """Precompute one fixed-support H_FD variable-projection workspace."""
 
@@ -560,10 +571,6 @@ def build_fixed_dynamics_varpro_workspace(
     if any(a < 0 or a >= L for a in atoms):
         raise ValueError("active_atoms contains an out-of-range atom index.")
 
-    D = np.stack(
-        [np.column_stack([B[:, atom] for B in blocks]) for atom in atoms],
-        axis=0,
-    )
     y_norm = float(np.linalg.norm(y))
     if y_norm <= np.finfo(float).tiny:
         raise ValueError("y must have nonzero norm.")
@@ -573,10 +580,12 @@ def build_fixed_dynamics_varpro_workspace(
     threshold_sq = float((eps * y_norm) ** 2)
 
     if compute_linear_relaxation:
-        A_relaxed = np.hstack([B[:, np.asarray(atoms, dtype=int)] for B in blocks])
-        beta, _, _, _ = np.linalg.lstsq(A_relaxed, y, rcond=None)
-        r_relaxed = np.asarray(y - A_relaxed @ beta, dtype=float)
-        relaxed_rho = float(np.linalg.norm(r_relaxed) / y_norm)
+        relaxed_rho = full_support_relaxation(blocks, atoms)
+        if relaxed_rho is None:
+            A_relaxed = np.hstack([dense_block(B[:, np.asarray(atoms, dtype=int)]) for B in blocks])
+            beta, _, _, _ = np.linalg.lstsq(A_relaxed, y, rcond=None)
+            r_relaxed = np.asarray(y - A_relaxed @ beta, dtype=float)
+            relaxed_rho = float(np.linalg.norm(r_relaxed) / y_norm)
         relaxation_infeasible = bool(relaxed_rho > eps * (1.0 + 1e-10))
     else:
         relaxed_rho = 0.0
@@ -584,7 +593,8 @@ def build_fixed_dynamics_varpro_workspace(
 
     return FixedDynamicsVarProWorkspace(
         y=np.asarray(y, dtype=float),
-        derivative_blocks=np.asarray(D, dtype=float),
+        structural_blocks=blocks,
+        linear_cache=StructuralLinearCache() if linear_cache is None else linear_cache,
         active_atoms=atoms,
         pivot_atom=int(atoms[0]),
         y_norm=y_norm,
@@ -610,7 +620,7 @@ def profile_fixed_dynamics_varpro(
     atoms = workspace.active_atoms
     d = len(atoms)
     y = workspace.y
-    D = workspace.derivative_blocks
+    blocks = workspace.structural_blocks
     scale = max(workspace.uncertainty_floor * workspace.y_norm, np.finfo(float).tiny)
 
     def theta_active_from_x(x: FloatArray) -> FloatArray:
@@ -622,31 +632,39 @@ def profile_fixed_dynamics_varpro(
 
     def compute_state(x: FloatArray, need_jac: bool):
         tha = theta_active_from_x(x)
-        C = np.tensordot(tha, D, axes=(0, 0))  # (rows, amplitudes)
-        U, sv, Vt = np.linalg.svd(C, full_matrices=False)
-        if sv.size:
-            tol = np.finfo(float).eps * max(C.shape) * float(sv[0])
-            keep = sv > tol
-        else:
-            keep = np.zeros(0, dtype=bool)
-        Ur = U[:, keep]
-        sr = sv[keep]
-        Vr = Vt[keep, :].T
-        if sr.size:
-            uy = Ur.T @ y
-            amp = Vr @ (uy / sr)
-            r = np.asarray(y - Ur @ uy, dtype=float)
-        else:
-            amp = np.zeros(C.shape[1], dtype=float)
-            r = y.copy()
+        full_theta = np.zeros(workspace.full_library_size)
+        full_theta[list(atoms)] = tha
+        key = workspace.linear_cache.key('svd', blocks, full_theta, y)
+        fit = workspace.linear_cache.get(key)
+        if fit is None:
+            # Mixed-law nonlinear steps usually visit each theta only once.
+            # Do not fill the column cache with those transient designs; the
+            # exact SVD-result cache still handles repeated theta/support pairs.
+            C = workspace.linear_cache.matrix(blocks, full_theta, cache_columns=(d == 1))
+            U, sv, Vt = np.linalg.svd(C, full_matrices=False)
+            if sv.size:
+                tol = np.finfo(float).eps * max(C.shape) * float(sv[0])
+                keep = sv > tol
+            else:
+                keep = np.zeros(0, dtype=bool)
+            Ur = U[:, keep]
+            sr = sv[keep]
+            Vr = Vt[keep, :].T
+            if sr.size:
+                uy = Ur.T @ y
+                amp = Vr @ (uy / sr)
+                r = np.asarray(y - Ur @ uy, dtype=float)
+            else:
+                amp = np.zeros(C.shape[1], dtype=float)
+                r = y.copy()
+            fit = workspace.linear_cache.put(key, (Ur, sr, Vr, amp, r))
+        Ur, sr, Vr, amp, r = fit
         if not need_jac or d <= 1:
             return tha, amp, r, None
 
-        Df = D[1:, :, :]
-        vdir = np.einsum("jra,a->rj", Df, amp, optimize=True)
+        vdir, b = derivative_products(blocks, amp, r, atoms[1:])
         if sr.size:
             term1 = -(vdir - Ur @ (Ur.T @ vdir))
-            b = np.einsum("jra,r->aj", Df, r, optimize=True)
             term2 = -Ur @ ((Vr.T @ b) / sr[:, None])
             jac = term1 + term2
         else:
@@ -746,6 +764,7 @@ def profile_fixed_dynamics(
     max_nfev: int = 250,
     compute_linear_relaxation: bool = True,
     include_default_start: bool = True,
+    linear_cache: Optional[StructuralLinearCache] = None,
 ) -> FixedDynamicsProfile:
     workspace = build_fixed_dynamics_varpro_workspace(
         y,
@@ -753,6 +772,7 @@ def profile_fixed_dynamics(
         active_atoms=active_atoms,
         uncertainty_floor=uncertainty_floor,
         compute_linear_relaxation=compute_linear_relaxation,
+        linear_cache=linear_cache,
     )
     return profile_fixed_dynamics_varpro(
         workspace,

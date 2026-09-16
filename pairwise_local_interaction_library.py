@@ -415,6 +415,7 @@ def build_candidate_pairwise_local_interaction_library(
         mode="candidate",
         feature_representation="endpoint_pairwise_candidate",
         metadata={
+            "mdl_mode": "candidate",
             "atom_descriptions": tuple(a.description for a in atoms),
             "atom_metadata": tuple(dict(a.metadata) for a in atoms),
             "swap_equivariant_flags": tuple(a.swap_equivariant for a in atoms),
@@ -441,7 +442,11 @@ def build_pairwise_local_interaction_library(
     atoms: Optional[Sequence[PairwiseLocalInteractionAtom]] = None,
     check_sampled_swap_equivariance: bool = False,
 ) -> PairwiseLocalInteractionLibrary:
-    """Unified constructor for the two supported TIDES local-library modes."""
+    """Unified constructor for the two supported TIDES local-library modes.
+
+    In candidate mode, omitted atoms select common_candidate_atoms('difference').
+    Pass an explicit atom sequence to use another preset or a custom dictionary.
+    """
 
     mode = str(mode).lower()
     if mode == "polynomial":
@@ -457,7 +462,7 @@ def build_pairwise_local_interaction_library(
 
     if mode == "candidate":
         if atoms is None:
-            raise ValueError("atoms are required when mode='candidate'.")
+            atoms = common_candidate_atoms("difference")
         return build_candidate_pairwise_local_interaction_library(
             node_states,
             D,
@@ -536,6 +541,125 @@ LINEAR_DIFFUSIVE_ATOM = make_antisymmetric_difference_atom(
 )
 
 
+def _positive_parameter(value: float, name: str) -> float:
+    value = float(value)
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be finite and positive.")
+    return value
+
+
+def make_sinusoidal_difference_atom(harmonic: int = 1) -> PairwiseLocalInteractionAtom:
+    """Fixed harmonic for phase states in radians; harmonic 1 is the built-in sin."""
+    if isinstance(harmonic, bool) or int(harmonic) != harmonic or harmonic < 1:
+        raise ValueError("harmonic must be a positive integer.")
+    harmonic = int(harmonic)
+    if harmonic == 1:
+        return KURAMOTO_SIN_ATOM
+    return make_antisymmetric_difference_atom(
+        f"sin_difference_h{harmonic}", lambda z: np.sin(harmonic * z),
+        metadata={"family": "periodic", "harmonic": harmonic, "state_domain": "phase_radians"},
+    )
+
+
+def make_saturating_difference_atom(scale: float = 1.0) -> PairwiseLocalInteractionAtom:
+    """Fixed-scale conservative saturation; scale is dictionary side information."""
+    scale = _positive_parameter(scale, "scale")
+    return make_antisymmetric_difference_atom(
+        f"tanh_difference_s{scale!r}", lambda z: np.tanh(z / scale),
+        metadata={"family": "saturating_difference", "scale": scale, "state_domain": "real"},
+    )
+
+
+def make_saturating_neighbor_atom(scale: float = 1.0) -> PairwiseLocalInteractionAtom:
+    scale = _positive_parameter(scale, "scale")
+    return PairwiseLocalInteractionAtom(
+        name=f"tanh_neighbor_s{scale!r}",
+        evaluate=lambda xs, xr: (np.tanh(xr / scale), np.tanh(xs / scale)),
+        description="Saturating neighbor input; endpoint contributions need not sum to zero.",
+        swap_equivariant=True,
+        metadata={"family": "saturating_input", "scale": scale, "state_domain": "real"},
+    )
+
+
+def make_hill_activation_atom(half_saturation: float = 1.0, exponent: float = 2.0) -> PairwiseLocalInteractionAtom:
+    """Neighbor Hill activation on nonnegative states, with fixed K and h."""
+    K = _positive_parameter(half_saturation, "half_saturation")
+    h = _positive_parameter(exponent, "exponent")
+
+    def hill(x):
+        if np.any(x < 0):
+            raise ValueError("Hill activation requires nonnegative physical states.")
+        # Stable logistic evaluation of h*(log(x)-log(K)), including x=0.
+        out = np.zeros_like(x, dtype=float)
+        positive = x > 0
+        with np.errstate(over="ignore", under="ignore"):
+            z = h * (np.log(x[positive]) - np.log(K))
+            out[positive] = np.exp(-np.logaddexp(0.0, -z))
+        return out
+
+    return PairwiseLocalInteractionAtom(
+        name=f"hill_activation_K{K!r}_h{h!r}",
+        evaluate=lambda xs, xr: (hill(xr), hill(xs)),
+        swap_equivariant=True,
+        description="Neighbor activation x^h/(K^h+x^h); h=1 gives Michaelis-Menten saturation.",
+        metadata={"family": "hill_activation", "half_saturation": K,
+                  "exponent": h, "state_domain": "nonnegative"},
+    )
+
+
+CUBIC_DIFFUSIVE_ATOM = make_antisymmetric_difference_atom(
+    "cubic_difference", lambda z: z**3,
+    description="Conservative cubic difference coupling.",
+    metadata={"family": "nonlinear_diffusive", "state_domain": "real"},
+)
+
+LINEAR_NEIGHBOR_ATOM = PairwiseLocalInteractionAtom(
+    name="linear_neighbor", evaluate=lambda xs, xr: (xr, xs),
+    swap_equivariant=True, metadata={"family": "neighbor_input", "state_domain": "real"},
+)
+
+MULTIPLICATIVE_ATOM = PairwiseLocalInteractionAtom(
+    name="multiplicative", evaluate=lambda xs, xr: (xs * xr, xs * xr),
+    description="Symmetric bilinear interaction, with sign supplied by the inferred coefficient.",
+    swap_equivariant=True, metadata={"family": "multiplicative", "state_domain": "real"},
+)
+
+
+def common_candidate_atoms(
+    preset: Literal["difference", "general", "nonnegative", "epidemic"] = "difference",
+    *,
+    saturation_scale: float = 1.0,
+    harmonics: Sequence[int] = (1,),
+) -> tuple[PairwiseLocalInteractionAtom, ...]:
+    """Small predeclared mechanism dictionaries, evaluated in physical units.
+
+    difference: linear, sinusoidal harmonics, tanh, cubic difference.
+    general: difference plus linear/saturating neighbor input and multiplication.
+    nonnegative: linear neighbor, multiplication, Hill h=1 and h=2.
+    epidemic: SIS and linear neighbor, intended for states in [0,1].
+
+    Select a dictionary and its fixed parameters before inference. No data-driven
+    domain filtering or hidden rescaling is performed. These are competing
+    mechanisms, not assertions that the data have a particular physical origin.
+    """
+    scale = _positive_parameter(saturation_scale, "saturation_scale")
+    if preset == "epidemic":
+        return (SIS_INTERACTION_ATOM, LINEAR_NEIGHBOR_ATOM)
+    if preset == "nonnegative":
+        return (LINEAR_NEIGHBOR_ATOM, MULTIPLICATIVE_ATOM,
+                make_hill_activation_atom(scale, 1), make_hill_activation_atom(scale, 2))
+    if preset not in {"difference", "general"}:
+        raise ValueError("Unknown candidate preset; use difference, general, nonnegative, or epidemic.")
+    periodic = tuple(make_sinusoidal_difference_atom(h) for h in harmonics)
+    if len({a.name for a in periodic}) != len(periodic):
+        raise ValueError("harmonics must be unique.")
+    base = (LINEAR_DIFFUSIVE_ATOM, *periodic,
+            make_saturating_difference_atom(scale), CUBIC_DIFFUSIVE_ATOM)
+    if preset == "general":
+        return (*base, LINEAR_NEIGHBOR_ATOM, make_saturating_neighbor_atom(scale), MULTIPLICATIVE_ATOM)
+    return base
+
+
 __all__ = [
     "PairwiseLocalInteractionAtom",
     "PairwiseLocalInteractionLibrary",
@@ -547,4 +671,12 @@ __all__ = [
     "SIS_INTERACTION_ATOM",
     "KURAMOTO_SIN_ATOM",
     "LINEAR_DIFFUSIVE_ATOM",
+    "CUBIC_DIFFUSIVE_ATOM",
+    "LINEAR_NEIGHBOR_ATOM",
+    "MULTIPLICATIVE_ATOM",
+    "make_sinusoidal_difference_atom",
+    "make_saturating_difference_atom",
+    "make_saturating_neighbor_atom",
+    "make_hill_activation_atom",
+    "common_candidate_atoms",
 ]

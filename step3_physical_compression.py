@@ -25,21 +25,23 @@ from numpy.typing import NDArray
 
 try:  # package form
     from .step2_edge_space_reconstruction import EdgeSpaceFieldFamily
-    from .mdl_description_length import MDLScore, PolynomialLibrary
+    from .mdl_description_length import MDLScore, PolynomialLibrary, CandidateLibrary, InteractionLibraryCode
     from .mdl_precision import UniformDyadicQuantizer
     from .mdl_search import (
         FixedDynamicsCompressionResult,
         FixedDynamicsMDLProblem,
         optimize_fixed_dynamics_mdl,
+        optimize_fixed_dynamics_mdl_alternating,
     )
 except ImportError:  # flat-file form
     from step2_edge_space_reconstruction import EdgeSpaceFieldFamily
-    from mdl_description_length import MDLScore, PolynomialLibrary
+    from mdl_description_length import MDLScore, PolynomialLibrary, CandidateLibrary, InteractionLibraryCode
     from mdl_precision import UniformDyadicQuantizer
     from mdl_search import (
         FixedDynamicsCompressionResult,
         FixedDynamicsMDLProblem,
         optimize_fixed_dynamics_mdl,
+        optimize_fixed_dynamics_mdl_alternating,
     )
 
 FloatArray = NDArray[np.float64]
@@ -86,8 +88,8 @@ class PhysicalCompressionResult:
 
 def _infer_polynomial_library(
     family: EdgeSpaceFieldFamily,
-    mdl_library: Optional[PolynomialLibrary],
-) -> PolynomialLibrary:
+    mdl_library: Optional[InteractionLibraryCode],
+) -> InteractionLibraryCode:
     if mdl_library is not None:
         if mdl_library.n_atoms != family.n_library_atoms:
             raise ValueError(
@@ -96,6 +98,8 @@ def _infer_polynomial_library(
         return mdl_library
 
     meta = dict(family.library_metadata)
+    if meta.get("mdl_mode") == "candidate":
+        return CandidateLibrary(atom_names=tuple(family.feature_labels))
     powers = meta.get("powers")
     max_degree = meta.get("degree")
     if powers is not None and max_degree is not None:
@@ -114,6 +118,8 @@ def _infer_polynomial_library(
         else:
             degrees = tuple()
     if not degrees or max_degree is None:
+        if family.feature_representation == "endpoint_pairwise_candidate":
+            return CandidateLibrary(atom_names=tuple(family.feature_labels))
         raise ValueError(
             "Cannot infer the polynomial MDL code from this Step-2 library. "
             "Supply mdl_library=PolynomialLibrary(...)."
@@ -148,7 +154,7 @@ def _edge_atom_block(design, edge_index: int) -> FloatArray:
 def build_fixed_dynamics_problem(
     field_family: EdgeSpaceFieldFamily,
     *,
-    mdl_library: Optional[PolynomialLibrary] = None,
+    mdl_library: Optional[InteractionLibraryCode] = None,
 ) -> FixedDynamicsMDLProblem:
     """Construct the H_FD Step-3 search problem from the Step-2 family.
 
@@ -266,7 +272,7 @@ def _supports_from_groups(
 def compress_fixed_dynamics(
     field_family: EdgeSpaceFieldFamily,
     *,
-    mdl_library: Optional[PolynomialLibrary] = None,
+    mdl_library: Optional[InteractionLibraryCode] = None,
     quantizer: Optional[UniformDyadicQuantizer] = None,
     quantizer_bound: float = 1.0,
     initial_groups: Optional[Sequence[tuple]] = None,
@@ -277,7 +283,15 @@ def compress_fixed_dynamics(
     basin_sigma_max: float = 1.5e-1,
     basin_local_max_nfev: int = 50,
     basin_initial_theta: Optional[FloatArray] = None,
+    search_strategy: str = "alternating_profiled",
     max_sweeps: int = 50,
+    max_structural_outer: int = 8,
+    structural_joint_candidates: int = 3,
+    structural_beyond_boundary: int = 1,
+    structural_polish_sweeps: int = 4,
+    max_expression_sweeps: int = 12,
+    theta_stability_tol: float = 1e-8,
+    final_max_nfev: int = 300,
     q_min: int = 1,
     q_max: int = 64,
     max_nfev: int = 250,
@@ -289,35 +303,90 @@ def compress_fixed_dynamics(
     top_atom_adds: int = 2,
     top_atom_swaps: int = 2,
 ) -> PhysicalCompressionResult:
-    """Run the complete H_FD factorization + conditional-MDL search."""
+    """Run H_FD factorization and MDL compression.
+
+    ``search_strategy="alternating_profiled"`` is the new default: the shared
+    law found on the full structural dictionary is used only as a dynamics
+    anchor.  Structural proposals are screened in the resulting linear network
+    problem, then shortlisted supports are re-profiled jointly in (W, Theta)
+    before MDL acceptance.
+
+    ``search_strategy="legacy"`` retains the earlier one-move-at-a-time search
+    for regression testing.
+    """
 
     problem = build_fixed_dynamics_problem(field_family, mdl_library=mdl_library)
     if quantizer is None:
         quantizer = UniformDyadicQuantizer(bound=float(quantizer_bound))
 
-    search = optimize_fixed_dynamics_mdl(
-        problem,
-        quantizer=quantizer,
-        initial_groups=initial_groups,
-        initial_atoms=initial_atoms,
-        n_basin_hops=n_basin_hops,
-        basin_seed=basin_seed,
-        basin_sigma_min=basin_sigma_min,
-        basin_sigma_max=basin_sigma_max,
-        basin_local_max_nfev=basin_local_max_nfev,
-        basin_initial_theta=basin_initial_theta,
-        max_sweeps=max_sweeps,
-        q_min=q_min,
-        q_max=q_max,
-        max_nfev=max_nfev,
-        max_coordinate_passes=max_coordinate_passes,
-        top_group_drops=top_group_drops,
-        top_group_adds=top_group_adds,
-        top_group_swaps=top_group_swaps,
-        top_atom_drops=top_atom_drops,
-        top_atom_adds=top_atom_adds,
-        top_atom_swaps=top_atom_swaps,
-    )
+    strategy = str(search_strategy).lower()
+    if strategy in {"alternating_profiled", "alternating", "dynamics_first"}:
+        # Preserve the old smoke-test meaning of max_sweeps=0: discover a
+        # feasible shared-law basin but do not compress the representation.
+        if int(max_sweeps) == 0:
+            structural_outer = structural_polish = expression_sweeps = 0
+        else:
+            structural_outer = max_structural_outer
+            structural_polish = structural_polish_sweeps
+            expression_sweeps = max_expression_sweeps
+
+        search = optimize_fixed_dynamics_mdl_alternating(
+            problem,
+            quantizer=quantizer,
+            initial_groups=initial_groups,
+            initial_atoms=initial_atoms,
+            n_basin_hops=n_basin_hops,
+            basin_seed=basin_seed,
+            basin_sigma_min=basin_sigma_min,
+            basin_sigma_max=basin_sigma_max,
+            basin_local_max_nfev=basin_local_max_nfev,
+            basin_initial_theta=basin_initial_theta,
+            max_structural_outer=structural_outer,
+            structural_joint_candidates=structural_joint_candidates,
+            structural_beyond_boundary=structural_beyond_boundary,
+            structural_polish_sweeps=structural_polish,
+            max_expression_sweeps=expression_sweeps,
+            theta_stability_tol=theta_stability_tol,
+            q_min=q_min,
+            q_max=q_max,
+            max_nfev=max_nfev,
+            final_max_nfev=final_max_nfev,
+            max_coordinate_passes=max_coordinate_passes,
+            polish_group_drops=min(top_group_drops, 3),
+            polish_group_adds=min(top_group_adds, 3),
+            polish_group_swaps=min(top_group_swaps, 3),
+            top_atom_drops=top_atom_drops,
+            top_atom_adds=top_atom_adds,
+            top_atom_swaps=top_atom_swaps,
+        )
+    elif strategy in {"legacy", "greedy_joint"}:
+        search = optimize_fixed_dynamics_mdl(
+            problem,
+            quantizer=quantizer,
+            initial_groups=initial_groups,
+            initial_atoms=initial_atoms,
+            n_basin_hops=n_basin_hops,
+            basin_seed=basin_seed,
+            basin_sigma_min=basin_sigma_min,
+            basin_sigma_max=basin_sigma_max,
+            basin_local_max_nfev=basin_local_max_nfev,
+            basin_initial_theta=basin_initial_theta,
+            max_sweeps=max_sweeps,
+            q_min=q_min,
+            q_max=q_max,
+            max_nfev=max_nfev,
+            max_coordinate_passes=max_coordinate_passes,
+            top_group_drops=top_group_drops,
+            top_group_adds=top_group_adds,
+            top_group_swaps=top_group_swaps,
+            top_atom_drops=top_atom_drops,
+            top_atom_adds=top_atom_adds,
+            top_atom_swaps=top_atom_swaps,
+        )
+    else:
+        raise ValueError(
+            "search_strategy must be 'alternating_profiled' or 'legacy'."
+        )
 
     state = search.best_state
     witness = state.precision.witness
@@ -380,6 +449,22 @@ def compress_fixed_dynamics(
             "n_active_structural_groups": int(len(state.active_groups)),
             "n_active_atoms": int(len(state.active_atoms)),
             "n_mdl_moves": int(len(search.history)),
+            "search_strategy": getattr(search, "search_strategy", strategy),
+            "n_structural_moves": int(len(getattr(search, "structural_history", ()))),
+            "n_expression_moves": int(len(getattr(search, "expression_history", ()))),
+            "theta_anchor_to_final_relative_change": (
+                None
+                if getattr(search, "theta_anchor", None) is None
+                else float(
+                    np.linalg.norm(
+                        np.asarray(thetac) - np.asarray(search.theta_anchor)
+                    )
+                    / max(
+                        np.linalg.norm(np.asarray(search.theta_anchor)),
+                        np.finfo(float).tiny,
+                    )
+                )
+            ),
             "quantizer_bound": float(quantizer.bound),
             "precision_status": "feasible_upper_bound",
         },

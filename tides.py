@@ -43,7 +43,7 @@ increasing sampling grid.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import factorial
 from typing import Any, Callable, Literal, Mapping, Optional, Sequence
 
@@ -604,12 +604,14 @@ def _build_relative_polynomial_library(
             )
         )
 
-    return build_candidate_pairwise_local_interaction_library(
+    result = build_candidate_pairwise_local_interaction_library(
         node_states,
         D,
         tuple(atoms),
         check_sampled_swap_equivariance=check_sampled_swap_equivariance,
     )
+    # This convenience mode uses candidate evaluators but retains polynomial coding.
+    return replace(result, metadata={**result.metadata, "mdl_mode": "polynomial"})
 
 
 def build_interaction_library(

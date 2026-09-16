@@ -11,15 +11,22 @@ coordinates W^(1), Delta W^(1),...,Delta W^(K-1).  Structural sparsity is not
 an admissibility assumption; active supports are selected only because they may
 shorten the final MDL code.
 
-Search has two phases:
-1. multiscale basin discovery for a floor-feasible shared law Theta;
-2. greedy MDL compression with structural and library-atom add/drop/swap moves.
+Search uses a dynamics-first, structure-guided joint-refinement strategy:
+1. recover a floor-feasible shared-law anchor Theta by variable projection;
+2. with Theta temporarily fixed, use the resulting linear network problem to
+   screen large structural-support reductions cheaply;
+3. jointly re-profile Theta and structural amplitudes on shortlisted supports,
+   and accept only true MDL improvements;
+4. polish structure locally, then compress the interaction expression and run
+   a final joint profile.
+
+Theta is therefore an anchor / warm start, never a permanently frozen law.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Hashable, Mapping, Optional, Sequence
+from dataclasses import dataclass, replace
+from typing import Callable, Hashable, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -27,6 +34,8 @@ try:  # package form
     from .mdl_description_length import (
         MDLScore,
         PolynomialLibrary,
+        InteractionLibraryCode,
+        CandidateLibrary,
         PolynomialObject,
         StructuralSupportBlock,
         compute_conditional_mdl,
@@ -45,6 +54,8 @@ except ImportError:  # flat-file form
     from mdl_description_length import (
         MDLScore,
         PolynomialLibrary,
+        InteractionLibraryCode,
+        CandidateLibrary,
         PolynomialObject,
         StructuralSupportBlock,
         compute_conditional_mdl,
@@ -94,7 +105,7 @@ class FixedDynamicsMDLProblem:
     structural_block_of_group: Mapping[GroupLabel, int]
     structural_candidate_counts: tuple[int, ...]
     structural_block_labels: tuple[Hashable, ...]
-    library: PolynomialLibrary
+    library: InteractionLibraryCode
     uncertainty_floor: float
     hypothesis: FixedDynamicsHypothesis = FixedDynamicsHypothesis()
 
@@ -161,6 +172,12 @@ class MDLMove:
             return f"add_atom({self.atom_in})"
         if self.kind == "swap_atom":
             return f"swap_atom({self.atom_out}->{self.atom_in})"
+        if self.kind == "drop_batch":
+            try:
+                n = len(self.group_out)  # type: ignore[arg-type]
+            except Exception:
+                n = "?"
+            return f"drop_batch({n})"
         return self.kind
 
 
@@ -221,12 +238,41 @@ class SharedLawBasinSearchResult:
 
 
 @dataclass(frozen=True)
+class FixedThetaSupportScreen:
+    """One support proposal screened with the current shared law held fixed."""
+
+    active_groups: tuple[GroupLabel, ...]
+    dropped_groups: tuple[GroupLabel, ...]
+    drop_count: int
+    fixed_theta_relative_residual: float
+    fixed_theta_feasible: bool
+    provisional_mdl_upper: float
+
+
+@dataclass(frozen=True)
 class FixedDynamicsCompressionStep:
     sweep: int
     move: MDLMove
     old_mdl_upper: float
     new_mdl_upper: float
     certified_improvement: bool
+    phase: str = "joint"
+    screened_relative_residual: Optional[float] = None
+    theta_relative_change: Optional[float] = None
+    n_exact_refits: int = 0
+
+
+@dataclass(frozen=True)
+class CandidateBranchSummary:
+    """Auditable outcome of a pure-law seed; scores are in nats, as elsewhere."""
+
+    seed_atom: int
+    initial_relative_residual: float
+    status: str
+    initial_mdl: Optional[float] = None
+    final_mdl: Optional[float] = None
+    final_atoms: tuple[int, ...] = ()
+    final_groups: tuple[GroupLabel, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -236,6 +282,12 @@ class FixedDynamicsCompressionResult:
     basin_search: SharedLawBasinSearchResult
     history: tuple[FixedDynamicsCompressionStep, ...]
     sweeps_completed: int
+    theta_anchor: Optional[FloatArray] = None
+    structural_history: tuple[FixedDynamicsCompressionStep, ...] = ()
+    expression_history: tuple[FixedDynamicsCompressionStep, ...] = ()
+    outer_iterations: int = 0
+    search_strategy: str = "legacy"
+    candidate_branches: tuple[CandidateBranchSummary, ...] = ()
 
 
 def _normalise_groups(problem: FixedDynamicsMDLProblem, groups: Sequence[GroupLabel]) -> tuple[GroupLabel, ...]:
@@ -461,7 +513,7 @@ def discover_fixed_dynamics_shared_law(
     history: list[SharedLawBasinHopStep] = []
     log_lo, log_hi = np.log(float(sigma_min)), np.log(float(sigma_max))
     free_arr = np.asarray(free_atoms, dtype=int)
-    degrees = np.asarray([problem.library.atom_degrees[a] for a in free_atoms], dtype=float)
+    degrees = np.asarray([problem.library.search_complexities[a] for a in free_atoms], dtype=float)
     probs = degrees ** (-degree_power)
     probs /= probs.sum()
 
@@ -584,9 +636,9 @@ def rank_fixed_dynamics_atom_drops(problem: FixedDynamicsMDLProblem, state: Fixe
         return []
     scored = []
     for atom in state.active_atoms:
-        if atom == state.continuous.pivot_atom:
+        if atom == state.continuous.pivot_atom and not isinstance(problem.library, CandidateLibrary):
             continue
-        scored.append((abs(float(state.continuous.theta[atom])), -problem.library.atom_degrees[atom], atom))
+        scored.append((abs(float(state.continuous.theta[atom])), -problem.library.search_complexities[atom], atom))
     scored.sort(key=lambda x: (x[0], x[1]))
     return [MDLMove("drop_atom", atom_out=a, proposal_score=float(mag)) for mag, _, a in scored[:max(0, int(top_k))]]
 
@@ -594,8 +646,8 @@ def rank_fixed_dynamics_atom_drops(problem: FixedDynamicsMDLProblem, state: Fixe
 def rank_fixed_dynamics_atom_adds(problem: FixedDynamicsMDLProblem, state: FixedDynamicsSearchState, *, top_k: int = 4) -> list[MDLMove]:
     active = set(state.active_atoms)
     candidates = [a for a in range(problem.library.n_atoms) if a not in active]
-    candidates.sort(key=lambda a: (problem.library.atom_degrees[a], a))
-    return [MDLMove("add_atom", atom_in=a, proposal_score=float(problem.library.atom_degrees[a])) for a in candidates[:max(0, int(top_k))]]
+    candidates.sort(key=lambda a: (problem.library.search_complexities[a], a))
+    return [MDLMove("add_atom", atom_in=a, proposal_score=float(problem.library.search_complexities[a])) for a in candidates[:max(0, int(top_k))]]
 
 
 def make_group_swaps(drops: Sequence[MDLMove], adds: Sequence[MDLMove], *, top_k: int = 8) -> list[MDLMove]:
@@ -729,6 +781,59 @@ def run_one_fixed_dynamics_sweep(
     return proposals, evaluations
 
 
+def _run_candidate_branches(
+    problem: FixedDynamicsMDLProblem,
+    optimizer: Callable[..., FixedDynamicsCompressionResult],
+    options: Mapping,
+) -> FixedDynamicsCompressionResult:
+    """Screen only by continuous feasibility, then finish every surviving branch.
+
+    Explicit initial_atoms bypasses this dispatcher in the recursive calls.
+    Each branch inherits all user search/precision budgets. Within-branch MDL
+    compression is unchanged; cross-branch ranking uses completed total MDL.
+    """
+    kwargs = dict(options)
+    kwargs.pop("problem")
+    groups = problem.groups if kwargs["initial_groups"] is None else tuple(kwargs["initial_groups"])
+    summaries = []
+    best = None
+    for atom in range(problem.library.n_atoms):
+        profile = profile_fixed_dynamics_candidate(
+            problem, groups, (atom,), max_nfev=kwargs["max_nfev"],
+            compute_linear_relaxation=False,
+        )
+        if not profile.feasible_witness:
+            summaries.append(CandidateBranchSummary(
+                atom, profile.relative_residual, "outside_continuous_floor",
+            ))
+            continue
+        branch_kwargs = {**kwargs, "initial_atoms": (atom,), "basin_initial_theta": profile.theta}
+        try:
+            result = optimizer(problem, **branch_kwargs)
+        except ValueError as exc:
+            # A finite search failure is recorded, not interpreted as proof that
+            # the law is impossible. Unexpected errors must still propagate.
+            if str(exc) != "No feasible quantized H_FD witness found up to q_max.":
+                raise
+            summaries.append(CandidateBranchSummary(
+                atom, profile.relative_residual, "no_quantized_initial_witness",
+            ))
+            continue
+        state = result.best_state
+        summaries.append(CandidateBranchSummary(
+            atom, profile.relative_residual, "completed",
+            result.initial_state.mdl_upper.total, state.mdl_upper.total,
+            state.active_atoms, state.active_groups,
+        ))
+        if best is None or state.mdl_upper.total < best.best_state.mdl_upper.total:
+            best = result
+    if best is None:
+        # Retain the existing mixed-library fallback; explicit support prevents
+        # dispatch recursion. No MDL threshold was used to discard a pure law.
+        best = optimizer(problem, **{**kwargs, "initial_atoms": tuple(range(problem.library.n_atoms))})
+    return replace(best, candidate_branches=tuple(summaries))
+
+
 def optimize_fixed_dynamics_mdl(
     problem: FixedDynamicsMDLProblem,
     *,
@@ -755,6 +860,9 @@ def optimize_fixed_dynamics_mdl(
     top_atom_swaps: int = 2,
 ) -> FixedDynamicsCompressionResult:
     """Find a feasible H_FD basin, then greedily shorten the witness MDL code."""
+
+    if isinstance(problem.library, CandidateLibrary) and initial_atoms is None:
+        return _run_candidate_branches(problem, optimize_fixed_dynamics_mdl, locals())
 
     groups0 = problem.groups if initial_groups is None else tuple(initial_groups)
     atoms0 = tuple(range(problem.library.n_atoms)) if initial_atoms is None else tuple(initial_atoms)
@@ -835,6 +943,753 @@ def optimize_fixed_dynamics_mdl(
     )
 
 
+# -----------------------------------------------------------------------------
+# Dynamics-first structural screening + joint refinement
+# -----------------------------------------------------------------------------
+
+
+def _theta_relative_change(old: FloatArray, new: FloatArray) -> float:
+    old = np.asarray(old, dtype=float).reshape(-1)
+    new = np.asarray(new, dtype=float).reshape(-1)
+    denom = max(float(np.linalg.norm(old)), np.finfo(float).tiny)
+    return float(np.linalg.norm(new - old) / denom)
+
+
+def _fixed_theta_linear_profile(
+    problem: FixedDynamicsMDLProblem,
+    groups: Sequence[GroupLabel],
+    theta: FloatArray,
+) -> tuple[FloatArray, FloatArray, float, float, int, FloatArray, FloatArray, FloatArray]:
+    """Solve the structural amplitudes exactly for one temporarily fixed Theta.
+
+    Returns
+    -------
+    amplitudes, residual, rss, rho, rank, C, C_scaled, beta_scaled
+
+    The solve uses RMS column scaling.  This is only a structural-screening
+    coordinate; shortlisted supports are subsequently re-profiled jointly in
+    (W, Theta).
+    """
+
+    gs = _normalise_groups(problem, groups)
+    theta = np.asarray(theta, dtype=float).reshape(-1)
+    if theta.size != problem.library.n_atoms:
+        raise ValueError("theta has the wrong library dimension.")
+    if not gs:
+        r = np.asarray(problem.y, dtype=float).copy()
+        rss = float(r @ r)
+        yn = float(np.linalg.norm(problem.y))
+        return (
+            np.zeros(0, dtype=float), r, rss,
+            float(np.sqrt(max(rss, 0.0)) / yn), 0,
+            np.zeros((problem.y.size, 0), dtype=float),
+            np.zeros((problem.y.size, 0), dtype=float),
+            np.zeros(0, dtype=float),
+        )
+
+    C = np.column_stack([problem.structural_blocks[g] @ theta for g in gs])
+    scales = np.sqrt(np.mean(C * C, axis=0))
+    bad = ~np.isfinite(scales) | (scales <= np.finfo(float).tiny)
+    scales[bad] = 1.0
+    Cs = C / scales[None, :]
+    beta_s, _, rank, _ = np.linalg.lstsq(Cs, problem.y, rcond=None)
+    beta = np.asarray(beta_s / scales, dtype=float)
+    r = np.asarray(problem.y - C @ beta, dtype=float)
+    rss = float(r @ r)
+    yn = float(np.linalg.norm(problem.y))
+    rho = float(np.sqrt(max(rss, 0.0)) / yn)
+    return beta, r, rss, rho, int(rank), C, Cs, np.asarray(beta_s, dtype=float)
+
+
+def _fixed_theta_drop_order(
+    problem: FixedDynamicsMDLProblem,
+    state: FixedDynamicsSearchState,
+) -> tuple[GroupLabel, ...]:
+    """Rank active structural groups by fixed-Theta deletion damage.
+
+    For a full-column-rank structural design, the single-deletion RSS increase
+    is exact:
+
+        Delta RSS_j = beta_j^2 / [(C^T C)^(-1)]_jj
+
+    evaluated in column-scaled coordinates.  If the current structural design
+    is numerically rank-deficient, a conservative zero-without-refit damage is
+    used only as a proposal ordering heuristic.
+    """
+
+    groups = tuple(state.active_groups)
+    if len(groups) <= 1:
+        return groups
+
+    beta, _, _, _, rank, C, Cs, beta_s = _fixed_theta_linear_profile(
+        problem, groups, state.continuous.theta
+    )
+    p = len(groups)
+
+    if rank == p:
+        G = np.asarray(Cs.T @ Cs, dtype=float)
+        try:
+            Ginv = np.linalg.inv(G)
+        except np.linalg.LinAlgError:
+            Ginv = np.linalg.pinv(G, rcond=1e-12)
+        d = np.diag(Ginv)
+        damage = np.full(p, np.inf, dtype=float)
+        good = np.isfinite(d) & (d > np.finfo(float).tiny)
+        damage[good] = (beta_s[good] ** 2) / d[good]
+    else:
+        # Proposal ranking only.  Exact shortlisted candidates are always
+        # re-fitted and jointly re-profiled before they can be accepted.
+        damage = (beta ** 2) * np.sum(C * C, axis=0)
+
+    order = np.argsort(damage, kind="stable")
+    return tuple(groups[int(j)] for j in order)
+
+
+def _provisional_fixed_theta_mdl(
+    problem: FixedDynamicsMDLProblem,
+    groups: Sequence[GroupLabel],
+    atoms: Sequence[int],
+    *,
+    relative_residual: float,
+    q_reference: int,
+) -> float:
+    """Heuristic MDL used only to rank fixed-Theta support proposals."""
+
+    if relative_residual > problem.uncertainty_floor * (1.0 + 1e-10):
+        return np.inf
+    Q = _free_parameter_count(groups, atoms)
+    score = compute_conditional_mdl(
+        structural_blocks=_structural_support_blocks(problem, groups),
+        polynomial_objects=_polynomial_objects(atoms),
+        library=problem.library,
+        relative_residual=relative_residual,
+        uncertainty_floor=problem.uncertainty_floor,
+        q_star=int(q_reference),
+        precision_parameter_count=Q,
+    )
+    return float(score.total)
+
+
+def screen_fixed_theta_support_path(
+    problem: FixedDynamicsMDLProblem,
+    state: FixedDynamicsSearchState,
+    *,
+    max_candidates: int = 4,
+    include_beyond_boundary: int = 1,
+) -> tuple[FixedThetaSupportScreen, ...]:
+    """Construct a cheap nested backward-elimination path at fixed Theta.
+
+    The path is not the final inference.  It only proposes structural supports.
+    The largest fixed-Theta-feasible pruning level is located by binary search
+    along a deletion ordering, then several supports around that boundary are
+    ranked with a provisional MDL that keeps the current q as a reference.
+
+    A small number of supports immediately beyond the fixed-Theta feasibility
+    boundary are retained deliberately: joint re-profiling of Theta may rescue
+    them.
+    """
+
+    groups0 = tuple(state.active_groups)
+    p = len(groups0)
+    if p <= 1 or max_candidates <= 0:
+        return tuple()
+
+    order = _fixed_theta_drop_order(problem, state)
+    order_pos = {g: i for i, g in enumerate(order)}
+    # Keep original problem ordering in every candidate support.
+    problem_order = {g: i for i, g in enumerate(problem.groups)}
+
+    cache: dict[int, FixedThetaSupportScreen] = {}
+
+    def screen_count(b: int) -> FixedThetaSupportScreen:
+        b = int(b)
+        if b in cache:
+            return cache[b]
+        if b < 0 or b >= p:
+            raise ValueError("drop_count must satisfy 0 <= b < n_active_groups.")
+        dropped = tuple(order[:b])
+        drop_set = set(dropped)
+        groups = tuple(sorted(
+            (g for g in groups0 if g not in drop_set),
+            key=lambda g: problem_order[g],
+        ))
+        _, _, _, rho, _, _, _, _ = _fixed_theta_linear_profile(
+            problem, groups, state.continuous.theta
+        )
+        qref = int(state.precision.q_upper or 1)
+        provisional = _provisional_fixed_theta_mdl(
+            problem,
+            groups,
+            state.active_atoms,
+            relative_residual=rho,
+            q_reference=qref,
+        )
+        out = FixedThetaSupportScreen(
+            active_groups=groups,
+            dropped_groups=dropped,
+            drop_count=b,
+            fixed_theta_relative_residual=float(rho),
+            fixed_theta_feasible=bool(
+                rho <= problem.uncertainty_floor * (1.0 + 1e-10)
+            ),
+            provisional_mdl_upper=float(provisional),
+        )
+        cache[b] = out
+        return out
+
+    # Monotonicity: on a nested support path the best fixed-Theta residual
+    # cannot decrease when more columns are removed.
+    lo, hi = 0, p - 1
+    if screen_count(hi).fixed_theta_feasible:
+        bmax = hi
+    else:
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if screen_count(mid).fixed_theta_feasible:
+                lo = mid
+            else:
+                hi = mid
+        bmax = lo
+
+    counts = set()
+    if bmax > 0:
+        counts.add(bmax)
+        # A sparse geometric ladder gives proposals far from and near the
+        # boundary without evaluating every nested support.
+        b = 1
+        while b < bmax:
+            counts.add(b)
+            b *= 2
+        for d in (-8, -4, -2, -1, 1, 2, 4):
+            q = bmax + d
+            if 1 <= q < p:
+                counts.add(q)
+        counts.add(max(1, bmax // 2))
+        counts.add(max(1, (3 * bmax) // 4))
+    else:
+        counts.add(1)
+
+    feasible = []
+    infeasible = []
+    for b in sorted(counts):
+        s = screen_count(b)
+        if s.fixed_theta_feasible:
+            feasible.append(s)
+        else:
+            infeasible.append(s)
+
+    feasible.sort(
+        key=lambda s: (
+            s.provisional_mdl_upper,
+            s.fixed_theta_relative_residual,
+            -s.drop_count,
+        )
+    )
+    infeasible.sort(
+        key=lambda s: (
+            s.fixed_theta_relative_residual,
+            -s.drop_count,
+        )
+    )
+
+    chosen: list[FixedThetaSupportScreen] = []
+    chosen.extend(feasible[: max(0, int(max_candidates))])
+
+    # Always expose the actual fixed-Theta boundary even if its provisional MDL
+    # is not among the first few; joint Theta motion can alter the ranking.
+    if bmax > 0:
+        boundary = screen_count(bmax)
+        if boundary not in chosen:
+            chosen.append(boundary)
+
+    n_beyond = max(0, int(include_beyond_boundary))
+    if n_beyond and bmax + 1 < p:
+        for b in range(bmax + 1, min(p, bmax + 1 + n_beyond)):
+            s = screen_count(b)
+            if s not in chosen:
+                chosen.append(s)
+
+    # Deduplicate supports and keep the shortlist compact.
+    uniq = {}
+    for s in chosen:
+        uniq[s.active_groups] = s
+    out = list(uniq.values())
+    out.sort(
+        key=lambda s: (
+            0 if s.fixed_theta_feasible else 1,
+            s.provisional_mdl_upper if np.isfinite(s.provisional_mdl_upper) else np.inf,
+            s.fixed_theta_relative_residual,
+        )
+    )
+    cap = max(1, int(max_candidates) + max(0, int(include_beyond_boundary)) + 1)
+    return tuple(out[:cap])
+
+
+def _build_joint_refined_state_fast(
+    problem: FixedDynamicsMDLProblem,
+    groups: Sequence[GroupLabel],
+    atoms: Sequence[int],
+    *,
+    quantizer: UniformDyadicQuantizer,
+    warm_theta: FloatArray,
+    warm_q: Optional[int],
+    q_min: int,
+    q_max: int,
+    max_nfev: int,
+    max_coordinate_passes: int,
+) -> Optional[FixedDynamicsSearchState]:
+    """Jointly re-profile a shortlisted support without a costly relaxation.
+
+    The linear relaxation is unnecessary for proposal candidates that already
+    have a fixed-Theta feasible witness.  For beyond-boundary candidates,
+    failure of the nonlinear warm-start profile is treated as a failed proposal,
+    not as a mathematical infeasibility certificate.
+    """
+
+    gs = _normalise_groups(problem, groups)
+    ats = _normalise_atoms(problem, atoms)
+    if not gs:
+        return None
+
+    continuous = profile_fixed_dynamics_candidate(
+        problem,
+        gs,
+        ats,
+        warm_theta=warm_theta,
+        max_nfev=max_nfev,
+        compute_linear_relaxation=False,
+        include_default_start=abs(float(warm_theta[ats[0]])) <= 1e-14,
+    )
+    if not continuous.feasible_witness:
+        return None
+
+    selected = _selected_blocks(problem, gs)
+    precision = profile_fixed_dynamics_precision_witness(
+        continuous,
+        selected,
+        quantizer=quantizer,
+        q_min=q_min,
+        q_max=q_max,
+        warm_q=warm_q,
+        max_coordinate_passes=max_coordinate_passes,
+    )
+    if precision.q_upper is None or precision.witness is None:
+        return None
+
+    Q = _free_parameter_count(gs, ats)
+    mdl = compute_conditional_mdl(
+        structural_blocks=_structural_support_blocks(problem, gs),
+        polynomial_objects=_polynomial_objects(ats),
+        library=problem.library,
+        relative_residual=precision.witness.relative_residual,
+        uncertainty_floor=problem.uncertainty_floor,
+        q_star=precision.q_upper,
+        precision_parameter_count=Q,
+    )
+    return FixedDynamicsSearchState(
+        active_groups=gs,
+        active_atoms=ats,
+        continuous=continuous,
+        precision=precision,
+        mdl_upper=mdl,
+        mdl_lower=_mdl_lower_bound(problem, gs, ats, q_min=q_min),
+    )
+
+
+
+def evaluate_fixed_dynamics_move_fast(
+    problem: FixedDynamicsMDLProblem,
+    state: FixedDynamicsSearchState,
+    move: MDLMove,
+    *,
+    quantizer: UniformDyadicQuantizer,
+    q_min: int = 1,
+    q_max: int = 64,
+    max_nfev: int = 120,
+    max_coordinate_passes: int = 4,
+) -> FixedDynamicsMoveEvaluation:
+    """Jointly refine one shortlisted move without the relaxed-model certificate."""
+
+    groups, atoms = _apply_move(problem, state, move)
+    if not groups:
+        return FixedDynamicsMoveEvaluation(
+            move, "rejected_empty_structure", 1.0, None, None,
+            np.inf, np.inf, None, True, False, None,
+        )
+    lb = _mdl_lower_bound(problem, groups, atoms, q_min=q_min)
+    if lb >= state.mdl_upper.total:
+        return FixedDynamicsMoveEvaluation(
+            move, "rejected_by_discrete_lower_bound", None, None, None,
+            lb, np.inf, None, True, False, None,
+        )
+
+    new_state = _build_joint_refined_state_fast(
+        problem,
+        groups,
+        atoms,
+        quantizer=quantizer,
+        warm_theta=state.continuous.theta,
+        warm_q=state.precision.q_upper,
+        q_min=q_min,
+        q_max=q_max,
+        max_nfev=max_nfev,
+        max_coordinate_passes=max_coordinate_passes,
+    )
+    if new_state is None:
+        return FixedDynamicsMoveEvaluation(
+            move,
+            "no_joint_feasible_witness_found",
+            None,
+            None,
+            None,
+            lb,
+            np.inf,
+            None,
+            False,
+            False,
+            None,
+        )
+
+    mdl = new_state.mdl_upper
+    return FixedDynamicsMoveEvaluation(
+        move=move,
+        status="profiled_feasible_fast",
+        continuous_relative_residual=float(new_state.continuous.relative_residual),
+        relaxed_relative_residual=None,
+        precision_q_upper=new_state.precision.q_upper,
+        mdl_lower=lb,
+        mdl_upper=float(mdl.total),
+        delta_upper_vs_current_upper=float(mdl.total - state.mdl_upper.total),
+        certified_reject=False,
+        certified_improve=bool(mdl.total < state.mdl_lower),
+        new_state=new_state,
+    )
+
+
+def run_one_fixed_dynamics_fast_sweep(
+    problem: FixedDynamicsMDLProblem,
+    state: FixedDynamicsSearchState,
+    *,
+    quantizer: UniformDyadicQuantizer,
+    top_group_drops: int = 2,
+    top_group_adds: int = 2,
+    top_group_swaps: int = 2,
+    top_atom_drops: int = 2,
+    top_atom_adds: int = 1,
+    top_atom_swaps: int = 1,
+    q_min: int = 1,
+    q_max: int = 64,
+    max_nfev: int = 120,
+    max_coordinate_passes: int = 4,
+) -> tuple[list[MDLMove], list[FixedDynamicsMoveEvaluation]]:
+    """Small shortlisted sweep used after the batch structural screen."""
+
+    gd = rank_fixed_dynamics_group_drops(problem, state, top_k=top_group_drops)
+    ga = rank_fixed_dynamics_group_adds(problem, state, top_k=top_group_adds)
+    gs = make_group_swaps(gd, ga, top_k=top_group_swaps)
+    ad = rank_fixed_dynamics_atom_drops(problem, state, top_k=top_atom_drops)
+    aa = rank_fixed_dynamics_atom_adds(problem, state, top_k=top_atom_adds)
+    ass = make_atom_swaps(ad, aa, top_k=top_atom_swaps)
+    proposals = list(gd) + list(ga) + list(gs) + list(ad) + list(aa) + list(ass)
+    evaluations = [
+        evaluate_fixed_dynamics_move_fast(
+            problem,
+            state,
+            m,
+            quantizer=quantizer,
+            q_min=q_min,
+            q_max=q_max,
+            max_nfev=max_nfev,
+            max_coordinate_passes=max_coordinate_passes,
+        )
+        for m in proposals
+    ]
+    evaluations.sort(key=lambda e: (e.mdl_upper, e.move.label()))
+    return proposals, evaluations
+
+
+def optimize_fixed_dynamics_mdl_alternating(
+    problem: FixedDynamicsMDLProblem,
+    *,
+    quantizer: UniformDyadicQuantizer,
+    initial_groups: Optional[Sequence[GroupLabel]] = None,
+    initial_atoms: Optional[Sequence[int]] = None,
+    n_basin_hops: int = 80,
+    basin_seed: Optional[int] = None,
+    basin_sigma_min: float = 5e-3,
+    basin_sigma_max: float = 1.5e-1,
+    basin_local_max_nfev: int = 50,
+    basin_initial_theta: Optional[FloatArray] = None,
+    max_structural_outer: int = 8,
+    structural_joint_candidates: int = 3,
+    structural_beyond_boundary: int = 1,
+    structural_polish_sweeps: int = 4,
+    max_expression_sweeps: int = 12,
+    mdl_improvement_tol: float = 1e-10,
+    theta_stability_tol: float = 1e-8,
+    q_min: int = 1,
+    q_max: int = 64,
+    max_nfev: int = 120,
+    final_max_nfev: int = 300,
+    max_coordinate_passes: int = 4,
+    polish_group_drops: int = 2,
+    polish_group_adds: int = 2,
+    polish_group_swaps: int = 2,
+    top_atom_drops: int = 2,
+    top_atom_adds: int = 1,
+    top_atom_swaps: int = 1,
+) -> FixedDynamicsCompressionResult:
+    """Dynamics-first structural inference with joint refinement.
+
+    Outer iteration
+    ---------------
+    1. The current Theta is an anchor obtained from exact variable projection.
+    2. Holding that Theta fixed *temporarily*, the structural problem is linear.
+       A nested backward-elimination path proposes large support reductions.
+    3. Only a small shortlist is re-profiled jointly in (W, Theta), quantized,
+       and scored with the full MDL objective.
+    4. The best true MDL improvement is accepted, which also updates Theta.
+
+    This is not a strict two-step estimator.  Theta can move after every
+    accepted structural change.  The initial shared law serves only to place the
+    search in the correct dynamical basin.
+    """
+
+    if isinstance(problem.library, CandidateLibrary) and initial_atoms is None:
+        return _run_candidate_branches(problem, optimize_fixed_dynamics_mdl_alternating, locals())
+
+    groups0 = problem.groups if initial_groups is None else tuple(initial_groups)
+    atoms0 = (
+        tuple(range(problem.library.n_atoms))
+        if initial_atoms is None
+        else tuple(initial_atoms)
+    )
+
+    basin = discover_fixed_dynamics_shared_law(
+        problem,
+        active_groups=groups0,
+        active_atoms=atoms0,
+        n_hops=n_basin_hops,
+        sigma_min=basin_sigma_min,
+        sigma_max=basin_sigma_max,
+        local_max_nfev=basin_local_max_nfev,
+        seed=basin_seed,
+        initial_theta=basin_initial_theta,
+    )
+    if not basin.reached_floor:
+        raise RuntimeError(
+            "Fixed-dynamics basin search did not enter the Step-2 uncertainty ball: "
+            f"best rho={basin.best_profile.relative_residual:.6e}, "
+            f"eps={problem.uncertainty_floor:.6e}."
+        )
+
+    state = build_fixed_dynamics_state(
+        problem,
+        groups0,
+        atoms0,
+        quantizer=quantizer,
+        q_min=q_min,
+        q_max=q_max,
+        warm_theta=basin.best_profile.theta,
+        max_nfev=max_nfev,
+        max_coordinate_passes=max_coordinate_passes,
+    )
+    initial_state = state
+    theta_anchor = np.asarray(state.continuous.theta, dtype=float).copy()
+
+    history: list[FixedDynamicsCompressionStep] = []
+    structural_history: list[FixedDynamicsCompressionStep] = []
+    expression_history: list[FixedDynamicsCompressionStep] = []
+    outer_done = 0
+    sweep_counter = 0
+
+    # Phase B: batch structural compression.  Atom support is held fixed, but
+    # Theta's numerical coefficients are re-profiled after every accepted batch.
+    for outer in range(max(0, int(max_structural_outer))):
+        outer_done = outer + 1
+        screens = screen_fixed_theta_support_path(
+            problem,
+            state,
+            max_candidates=max(1, int(structural_joint_candidates)),
+            include_beyond_boundary=max(0, int(structural_beyond_boundary)),
+        )
+        if not screens:
+            break
+
+        refined: list[tuple[FixedThetaSupportScreen, FixedDynamicsSearchState]] = []
+        for screen in screens:
+            cand = _build_joint_refined_state_fast(
+                problem,
+                screen.active_groups,
+                state.active_atoms,
+                quantizer=quantizer,
+                warm_theta=state.continuous.theta,
+                warm_q=state.precision.q_upper,
+                q_min=q_min,
+                q_max=q_max,
+                max_nfev=max_nfev,
+                max_coordinate_passes=max_coordinate_passes,
+            )
+            if cand is not None:
+                refined.append((screen, cand))
+
+        if not refined:
+            break
+        screen_best, cand_best = min(refined, key=lambda sc: sc[1].mdl_upper.total)
+        if cand_best.mdl_upper.total >= state.mdl_upper.total - float(mdl_improvement_tol):
+            break
+
+        old = state
+        state = cand_best
+        theta_drift = _theta_relative_change(old.continuous.theta, state.continuous.theta)
+        step = FixedDynamicsCompressionStep(
+            sweep=sweep_counter,
+            move=MDLMove(
+                "drop_batch",
+                group_out=screen_best.dropped_groups,
+                proposal_score=float(screen_best.drop_count),
+            ),
+            old_mdl_upper=float(old.mdl_upper.total),
+            new_mdl_upper=float(state.mdl_upper.total),
+            certified_improvement=bool(state.mdl_upper.total < old.mdl_lower),
+            phase="structural_batch",
+            screened_relative_residual=float(screen_best.fixed_theta_relative_residual),
+            theta_relative_change=float(theta_drift),
+            n_exact_refits=len(refined),
+        )
+        sweep_counter += 1
+        history.append(step)
+        structural_history.append(step)
+
+        # Once the law barely moves, a new structural screen is still useful;
+        # convergence is declared only when no MDL-improving support is found.
+        _ = theta_stability_tol  # retained as an exposed diagnostic tolerance
+
+    # Local single-move structural polish / rescue.  This can re-add a group or
+    # swap one if the coarse nested path made a suboptimal deletion.
+    for _ in range(max(0, int(structural_polish_sweeps))):
+        _, evals = run_one_fixed_dynamics_fast_sweep(
+            problem,
+            state,
+            quantizer=quantizer,
+            top_group_drops=polish_group_drops,
+            top_group_adds=polish_group_adds,
+            top_group_swaps=polish_group_swaps,
+            top_atom_drops=0,
+            top_atom_adds=0,
+            top_atom_swaps=0,
+            q_min=q_min,
+            q_max=q_max,
+            max_nfev=max_nfev,
+            max_coordinate_passes=max_coordinate_passes,
+        )
+        feasible = [
+            e for e in evals
+            if e.new_state is not None and np.isfinite(e.mdl_upper)
+        ]
+        if not feasible:
+            break
+        best = min(feasible, key=lambda e: e.mdl_upper)
+        if best.mdl_upper >= state.mdl_upper.total - float(mdl_improvement_tol):
+            break
+        old = state
+        state = best.new_state
+        assert state is not None
+        step = FixedDynamicsCompressionStep(
+            sweep=sweep_counter,
+            move=best.move,
+            old_mdl_upper=float(old.mdl_upper.total),
+            new_mdl_upper=float(state.mdl_upper.total),
+            certified_improvement=bool(best.certified_improve),
+            phase="structural_polish",
+            screened_relative_residual=best.continuous_relative_residual,
+            theta_relative_change=_theta_relative_change(
+                old.continuous.theta, state.continuous.theta
+            ),
+            n_exact_refits=len(evals),
+        )
+        sweep_counter += 1
+        history.append(step)
+        structural_history.append(step)
+
+    # Phase C: with the structural sector selected, compress the shared
+    # interaction expression.  Every accepted atom move still re-profiles W and
+    # all remaining Theta coefficients jointly.
+    for _ in range(max(0, int(max_expression_sweeps))):
+        _, evals = run_one_fixed_dynamics_fast_sweep(
+            problem,
+            state,
+            quantizer=quantizer,
+            top_group_drops=0,
+            top_group_adds=0,
+            top_group_swaps=0,
+            top_atom_drops=top_atom_drops,
+            top_atom_adds=top_atom_adds,
+            top_atom_swaps=top_atom_swaps,
+            q_min=q_min,
+            q_max=q_max,
+            max_nfev=max_nfev,
+            max_coordinate_passes=max_coordinate_passes,
+        )
+        feasible = [
+            e for e in evals
+            if e.new_state is not None and np.isfinite(e.mdl_upper)
+        ]
+        if not feasible:
+            break
+        best = min(feasible, key=lambda e: e.mdl_upper)
+        if best.mdl_upper >= state.mdl_upper.total - float(mdl_improvement_tol):
+            break
+        old = state
+        state = best.new_state
+        assert state is not None
+        step = FixedDynamicsCompressionStep(
+            sweep=sweep_counter,
+            move=best.move,
+            old_mdl_upper=float(old.mdl_upper.total),
+            new_mdl_upper=float(state.mdl_upper.total),
+            certified_improvement=bool(best.certified_improve),
+            phase="expression",
+            screened_relative_residual=best.continuous_relative_residual,
+            theta_relative_change=_theta_relative_change(
+                old.continuous.theta, state.continuous.theta
+            ),
+            n_exact_refits=len(evals),
+        )
+        sweep_counter += 1
+        history.append(step)
+        expression_history.append(step)
+
+    # Phase D: final joint polish on the selected discrete model.
+    polished = _build_joint_refined_state_fast(
+        problem,
+        state.active_groups,
+        state.active_atoms,
+        quantizer=quantizer,
+        warm_theta=state.continuous.theta,
+        warm_q=state.precision.q_upper,
+        q_min=q_min,
+        q_max=q_max,
+        max_nfev=max(final_max_nfev, max_nfev),
+        max_coordinate_passes=max_coordinate_passes,
+    )
+    if polished is not None and polished.mdl_upper.total <= state.mdl_upper.total + float(mdl_improvement_tol):
+        state = polished
+
+    return FixedDynamicsCompressionResult(
+        initial_state=initial_state,
+        best_state=state,
+        basin_search=basin,
+        history=tuple(history),
+        sweeps_completed=int(sweep_counter),
+        theta_anchor=theta_anchor,
+        structural_history=tuple(structural_history),
+        expression_history=tuple(expression_history),
+        outer_iterations=int(outer_done),
+        search_strategy="alternating_profiled",
+    )
+
+
 __all__ = [
     "FixedDynamicsHypothesis",
     "FixedDynamicsMDLProblem",
@@ -843,8 +1698,10 @@ __all__ = [
     "FixedDynamicsMoveEvaluation",
     "SharedLawBasinHopStep",
     "SharedLawBasinSearchResult",
+    "FixedThetaSupportScreen",
     "FixedDynamicsCompressionStep",
     "FixedDynamicsCompressionResult",
+    "CandidateBranchSummary",
     "profile_fixed_dynamics_candidate",
     "build_fixed_dynamics_state",
     "discover_fixed_dynamics_shared_law",
@@ -856,5 +1713,9 @@ __all__ = [
     "make_atom_swaps",
     "evaluate_fixed_dynamics_move",
     "run_one_fixed_dynamics_sweep",
+    "screen_fixed_theta_support_path",
+    "evaluate_fixed_dynamics_move_fast",
+    "run_one_fixed_dynamics_fast_sweep",
     "optimize_fixed_dynamics_mdl",
+    "optimize_fixed_dynamics_mdl_alternating",
 ]

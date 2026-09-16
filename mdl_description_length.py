@@ -82,6 +82,41 @@ class PolynomialLibrary:
     def count_up_to_degree(self, p: int) -> int:
         return sum(d <= int(p) for d in self.atom_degrees)
 
+    @property
+    def search_complexities(self) -> tuple[int, ...]:
+        return self.atom_degrees
+
+
+@dataclass(frozen=True)
+class CandidateLibrary:
+    """Fixed dictionary supplied as side information, including atom parameters.
+
+    Encode a nonempty support by log(L) + log binomial(L, s). All atoms
+    have equal prior weight. Continuous or data-selected mechanism parameters
+    require additional coding; this class only covers a predeclared dictionary.
+    """
+
+    atom_names: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        names = tuple(str(name) for name in self.atom_names)
+        if not names or any(not name.strip() for name in names):
+            raise ValueError("CandidateLibrary requires nonempty atom names.")
+        if len(set(names)) != len(names):
+            raise ValueError("CandidateLibrary atom names must be unique.")
+        object.__setattr__(self, "atom_names", names)
+
+    @property
+    def n_atoms(self) -> int:
+        return len(self.atom_names)
+
+    @property
+    def search_complexities(self) -> tuple[int, ...]:
+        return (1,) * self.n_atoms
+
+
+InteractionLibraryCode = PolynomialLibrary | CandidateLibrary
+
 
 @dataclass(frozen=True)
 class PolynomialObject:
@@ -228,11 +263,13 @@ def _structural_block_code(block: StructuralSupportBlock) -> float:
     return float(log(M + 1.0) + _log_choose(M, E))
 
 
-def _polynomial_object_code(obj: PolynomialObject, library: PolynomialLibrary) -> float:
+def _polynomial_object_code(obj: PolynomialObject, library: InteractionLibraryCode) -> float:
     atoms = obj.active_atoms
     if max(atoms) >= library.n_atoms:
         raise ValueError("PolynomialObject references an atom outside the library.")
     s = len(atoms)
+    if isinstance(library, CandidateLibrary):
+        return float(log(library.n_atoms) + _log_choose(library.n_atoms, s))
     p = max(library.atom_degrees[i] for i in atoms)
     Lp = library.count_up_to_degree(p)
     Lprev = library.count_up_to_degree(p - 1)
@@ -272,7 +309,7 @@ def compute_conditional_mdl(
     *,
     structural_blocks: Optional[Sequence[StructuralSupportBlock]] = None,
     polynomial_objects: Sequence[PolynomialObject],
-    library: PolynomialLibrary,
+    library: InteractionLibraryCode,
     relative_residual: float,
     uncertainty_floor: float,
     q_star: Optional[int],
@@ -324,7 +361,7 @@ def compute_conditional_mdl(
 def compute_mdl_delta(
     old_score: MDLScore,
     *,
-    library: PolynomialLibrary,
+    library: InteractionLibraryCode,
     structural_updates: Sequence[StructuralBlockUpdate] = (),
     expression_updates: Sequence[ExpressionObjectUpdate] = (),
     new_relative_residual: Optional[float] = None,
@@ -420,6 +457,8 @@ __all__ = [
     "StructuralSupportBlock",
     "TemporalSupportBlock",
     "PolynomialLibrary",
+    "CandidateLibrary",
+    "InteractionLibraryCode",
     "PolynomialObject",
     "StructuralBlockUpdate",
     "TemporalBlockUpdate",

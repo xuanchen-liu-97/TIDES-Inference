@@ -67,6 +67,7 @@ try:  # package imports
         PhysicalCompressionResult,
         compress_physical_representation,
     )
+    from .trajectory_smoothing import SegmentedSmoothingResult, smooth_segmented_trajectory
 except ImportError:  # flat-file imports
     from step1_change_detection import ChangeDetectionResult, detect_changes
     from pairwise_local_interaction_library import (
@@ -84,6 +85,7 @@ except ImportError:  # flat-file imports
         PhysicalCompressionResult,
         compress_physical_representation,
     )
+    from trajectory_smoothing import SegmentedSmoothingResult, smooth_segmented_trajectory
 
 
 FloatArray = NDArray[np.float64]
@@ -129,6 +131,7 @@ class TrajectoryPreprocessingResult:
     resolution_relative_max: Optional[float]
     estimated_uncertainty_floor: Optional[float]
     uncertainty_multiplier: Optional[float]
+    smoothing: Optional[SegmentedSmoothingResult] = None
 
     @property
     def n_observations(self) -> int:
@@ -369,7 +372,8 @@ def preprocess_trajectory(
     t: ArrayLike,
     transition_indices: Sequence[int],
     *,
-    method: Literal["four_point_midpoint", "secant_midpoint"] = "four_point_midpoint",
+    method: Literal["four_point_midpoint", "secant_midpoint", "local_polynomial"] = "four_point_midpoint",
+    smoothing_kwargs: Optional[Mapping[str, Any]] = None,
     intrinsic_vector_field: Optional[IntrinsicVectorField | ArrayLike] = None,
     resolution_audit: bool = True,
     uncertainty_multiplier: float = 20.0,
@@ -384,6 +388,13 @@ def preprocess_trajectory(
         preprocessing.  ``'secant_midpoint'`` uses arithmetic midpoint states
         and interval secant velocities and is mainly useful for diagnostics or
         noisier pipelines with their own externally supplied uncertainty floor.
+        ``'local_polynomial'`` fits states and derivatives jointly within each
+        stage using ``trajectory_smoothing.smooth_segmented_trajectory``.
+    smoothing_kwargs
+        Options for the local-polynomial path, such as window_size, degree,
+        boundary, trim_intervals and measurement_noise_std. Noise diagnostics
+        are returned in ``result.smoothing``. This path does not infer epsilon;
+        a noise/bias-calibrated uncertainty floor must be supplied to Step 2.
     intrinsic_vector_field
         Optional known node-local term to subtract before Step 2.  Supply either
         an array with shape ``(n_observations,n_nodes)``, a constant vector with
@@ -410,10 +421,16 @@ def preprocess_trajectory(
     transition_times = t_arr[transitions]
 
     method = str(method).lower()
-    if method not in {"four_point_midpoint", "secant_midpoint"}:
+    if method not in {"four_point_midpoint", "secant_midpoint", "local_polynomial"}:
         raise ValueError(
-            "method must be 'four_point_midpoint' or 'secant_midpoint'."
+            "method must be 'four_point_midpoint', 'secant_midpoint' or 'local_polynomial'."
         )
+    smoothing_options = {} if smoothing_kwargs is None else dict(smoothing_kwargs)
+    if method != "local_polynomial" and smoothing_options:
+        raise ValueError("smoothing_kwargs requires method='local_polynomial'.")
+    if {"X", "t", "transition_indices"} & smoothing_options.keys():
+        raise ValueError("Supply trajectory and transitions through the preprocessing arguments.")
+    smoothing_result = None
 
     obs_ids: list[int] = []
     x_obs: list[FloatArray] = []
@@ -421,7 +438,16 @@ def preprocess_trajectory(
     t_obs: list[float] = []
     s_obs: list[int] = []
 
-    if method == "secant_midpoint":
+    if method == "local_polynomial":
+        smoothing_result = smooth_segmented_trajectory(
+            X_arr, t_arr, transitions, **smoothing_options,
+        )
+        obs_ids = smoothing_result.observation_interval_indices
+        x_obs = smoothing_result.x_mid
+        v_obs = smoothing_result.velocity_mid
+        t_obs = smoothing_result.t_mid
+        s_obs = smoothing_result.stage_of_observation
+    elif method == "secant_midpoint":
         dt = np.diff(t_arr)
         X_mid = 0.5 * (X_arr[:-1] + X_arr[1:])
         V_mid = np.diff(X_arr, axis=0) / dt[:, None]
@@ -552,6 +578,7 @@ def preprocess_trajectory(
             if method == "four_point_midpoint" and resolution_audit
             else None
         ),
+        smoothing=smoothing_result,
     )
 
 
@@ -741,8 +768,9 @@ def run_tides(
     step1_kwargs: Optional[Mapping[str, Any]] = None,
     # Trajectory -> midpoint vector-field observations.
     preprocessing_method: Literal[
-        "four_point_midpoint", "secant_midpoint"
+        "four_point_midpoint", "secant_midpoint", "local_polynomial"
     ] = "four_point_midpoint",
+    smoothing_kwargs: Optional[Mapping[str, Any]] = None,
     intrinsic_vector_field: Optional[IntrinsicVectorField | ArrayLike] = None,
     resolution_audit: bool = True,
     uncertainty_floor: Optional[float] = None,
@@ -775,7 +803,9 @@ def run_tides(
 
         epsilon = uncertainty_multiplier * resolution_relative_max.
 
-    An explicit floor is required when that audit is unavailable.
+    An explicit floor is required when that audit is unavailable, including
+    the local-polynomial smoothing path. ``smoothing_kwargs`` is forwarded to
+    ``preprocess_trajectory``; its noise gains alone are not an epsilon estimate.
     """
 
     X_arr, t_arr = _validate_trajectory(X, t)
@@ -809,6 +839,7 @@ def run_tides(
         t_arr,
         transitions,
         method=preprocessing_method,
+        smoothing_kwargs=smoothing_kwargs,
         intrinsic_vector_field=intrinsic_vector_field,
         resolution_audit=resolution_audit,
         uncertainty_multiplier=uncertainty_multiplier,

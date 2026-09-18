@@ -50,6 +50,7 @@ try:  # package form
     from .mdl_precision import (
         FixedDynamicsProfile,
         FixedDynamicsPrecisionProfile,
+        FixedDynamicsQuantizationError,
         FixedDynamicsVarProWorkspace,
         UniformDyadicQuantizer,
         build_fixed_dynamics_varpro_workspace,
@@ -70,6 +71,7 @@ except ImportError:  # flat-file form
     from mdl_precision import (
         FixedDynamicsProfile,
         FixedDynamicsPrecisionProfile,
+        FixedDynamicsQuantizationError,
         FixedDynamicsVarProWorkspace,
         UniformDyadicQuantizer,
         build_fixed_dynamics_varpro_workspace,
@@ -281,6 +283,8 @@ class CandidateBranchSummary:
     final_mdl: Optional[float] = None
     final_atoms: tuple[int, ...] = ()
     final_groups: tuple[GroupLabel, ...] = ()
+    precision_diagnostics: Optional[Mapping] = None
+    sa_chains: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -296,6 +300,7 @@ class FixedDynamicsCompressionResult:
     outer_iterations: int = 0
     search_strategy: str = "legacy"
     candidate_branches: tuple[CandidateBranchSummary, ...] = ()
+    sa_chains: tuple = ()
 
 
 def _normalise_groups(problem: FixedDynamicsMDLProblem, groups: Sequence[GroupLabel]) -> tuple[GroupLabel, ...]:
@@ -443,7 +448,7 @@ def build_fixed_dynamics_state(
         max_coordinate_passes=max_coordinate_passes,
     )
     if precision.q_upper is None or precision.witness is None:
-        raise ValueError("No feasible quantized H_FD witness found up to q_max.")
+        raise FixedDynamicsQuantizationError(precision)
     Q = _free_parameter_count(groups, atoms)
     mdl = compute_conditional_mdl(
         structural_blocks=_structural_support_blocks(problem, groups),
@@ -600,6 +605,10 @@ def _apply_move(problem: FixedDynamicsMDLProblem, state: FixedDynamicsSearchStat
 
 
 def rank_fixed_dynamics_group_drops(problem: FixedDynamicsMDLProblem, state: FixedDynamicsSearchState, *, top_k: int = 8) -> list[MDLMove]:
+    # A disabled shortlist was already empty after scoring. Avoid computing
+    # unused contributions (and touching the shared linear-algebra cache).
+    if int(top_k) <= 0:
+        return []
     r = state.continuous.residual
     theta = state.continuous.theta
     scored = []
@@ -614,6 +623,10 @@ def rank_fixed_dynamics_group_drops(problem: FixedDynamicsMDLProblem, state: Fix
 
 
 def rank_fixed_dynamics_group_adds(problem: FixedDynamicsMDLProblem, state: FixedDynamicsSearchState, *, top_k: int = 8) -> list[MDLMove]:
+    # Swaps consume this returned shortlist too, so an empty shortlist never
+    # contributes a swap. No design matrix, SVD, or edge scoring is needed.
+    if int(top_k) <= 0:
+        return []
     theta = state.continuous.theta
     active = set(state.active_groups)
     selected = _selected_blocks(problem, state.active_groups)
@@ -820,13 +833,12 @@ def _run_candidate_branches(
         branch_kwargs = {**kwargs, "initial_atoms": (atom,), "basin_initial_theta": profile.theta}
         try:
             result = optimizer(problem, **branch_kwargs)
-        except ValueError as exc:
+        except FixedDynamicsQuantizationError as exc:
             # A finite search failure is recorded, not interpreted as proof that
             # the law is impossible. Unexpected errors must still propagate.
-            if str(exc) != "No feasible quantized H_FD witness found up to q_max.":
-                raise
             summaries.append(CandidateBranchSummary(
                 atom, profile.relative_residual, "no_quantized_initial_witness",
+                precision_diagnostics=exc.diagnostics,
             ))
             continue
         state = result.best_state
@@ -834,6 +846,8 @@ def _run_candidate_branches(
             atom, profile.relative_residual, "completed",
             result.initial_state.mdl_upper.total, state.mdl_upper.total,
             state.active_atoms, state.active_groups,
+            result.initial_state.precision.diagnostics,
+            sa_chains=result.sa_chains,
         ))
         if best is None or state.mdl_upper.total < best.best_state.mdl_upper.total:
             best = result
@@ -1253,6 +1267,7 @@ def _build_joint_refined_state_fast(
     q_max: int,
     max_nfev: int,
     max_coordinate_passes: int,
+    diagnostics: Optional[dict] = None,
 ) -> Optional[FixedDynamicsSearchState]:
     """Jointly re-profile a shortlisted support without a costly relaxation.
 
@@ -1265,6 +1280,8 @@ def _build_joint_refined_state_fast(
     gs = _normalise_groups(problem, groups)
     ats = _normalise_atoms(problem, atoms)
     if not gs:
+        if diagnostics is not None:
+            diagnostics['status'] = 'empty_structure'
         return None
 
     continuous = profile_fixed_dynamics_candidate(
@@ -1277,6 +1294,9 @@ def _build_joint_refined_state_fast(
         include_default_start=abs(float(warm_theta[ats[0]])) <= 1e-14,
     )
     if not continuous.feasible_witness:
+        if diagnostics is not None:
+            diagnostics.update(status='continuous_fit_outside_floor',
+                               continuous_residual=float(continuous.relative_residual))
         return None
 
     selected = _selected_blocks(problem, gs)
@@ -1290,6 +1310,9 @@ def _build_joint_refined_state_fast(
         max_coordinate_passes=max_coordinate_passes,
     )
     if precision.q_upper is None or precision.witness is None:
+        if diagnostics is not None:
+            diagnostics.update(status='no_quantized_witness',
+                               continuous_residual=float(continuous.relative_residual))
         return None
 
     Q = _free_parameter_count(gs, ats)
@@ -1424,6 +1447,18 @@ def run_one_fixed_dynamics_fast_sweep(
     return proposals, evaluations
 
 
+def _resolve_mdl_search_rounds(max_mdl_search_rounds, max_structural_outer):
+    """Resolve the main-loop budget (default 8), retaining the old keyword alias."""
+    if max_mdl_search_rounds is not None and max_structural_outer is not None:
+        if max_mdl_search_rounds != max_structural_outer:
+            raise ValueError(
+                "Conflicting max_mdl_search_rounds and legacy max_structural_outer; "
+                "supply only max_mdl_search_rounds."
+            )
+    value = max_mdl_search_rounds if max_mdl_search_rounds is not None else max_structural_outer
+    return 8 if value is None else value
+
+
 def optimize_fixed_dynamics_mdl_alternating(
     problem: FixedDynamicsMDLProblem,
     *,
@@ -1436,7 +1471,8 @@ def optimize_fixed_dynamics_mdl_alternating(
     basin_sigma_max: float = 1.5e-1,
     basin_local_max_nfev: int = 50,
     basin_initial_theta: Optional[FloatArray] = None,
-    max_structural_outer: int = 8,
+    max_mdl_search_rounds: Optional[int] = None,
+    max_structural_outer: Optional[int] = None,
     structural_joint_candidates: int = 3,
     structural_beyond_boundary: int = 1,
     structural_polish_sweeps: int = 4,
@@ -1469,7 +1505,17 @@ def optimize_fixed_dynamics_mdl_alternating(
     This is not a strict two-step estimator.  Theta can move after every
     accepted structural change.  The initial shared law serves only to place the
     search in the correct dynamical basin.
+
+    ``max_mdl_search_rounds`` caps the main search loop (default 8), not basin
+    discovery, local polish, expression search, or quantization iterations.
+    The loop may stop early if no improving candidate is found.
+    ``max_structural_outer`` is retained only as a backwards-compatible alias;
+    conflicting values for the two names are rejected.
     """
+
+    max_mdl_search_rounds = _resolve_mdl_search_rounds(
+        max_mdl_search_rounds, max_structural_outer,
+    )
 
     if isinstance(problem.library, CandidateLibrary) and initial_atoms is None:
         return _run_candidate_branches(problem, optimize_fixed_dynamics_mdl_alternating, locals())
@@ -1521,7 +1567,7 @@ def optimize_fixed_dynamics_mdl_alternating(
 
     # Phase B: batch structural compression.  Atom support is held fixed, but
     # Theta's numerical coefficients are re-profiled after every accepted batch.
-    for outer in range(max(0, int(max_structural_outer))):
+    for outer in range(max(0, int(max_mdl_search_rounds))):
         outer_done = outer + 1
         screens = screen_fixed_theta_support_path(
             problem,
@@ -1706,7 +1752,197 @@ def optimize_fixed_dynamics_mdl_alternating(
     )
 
 
+def _sa_acceptance_probability(delta_bits, temperature_bits):
+    """Metropolis-style optimization, not a posterior MH sampling kernel."""
+    if delta_bits <= 0.0:
+        return 1.0
+    return float(np.exp2(-delta_bits / temperature_bits))
+
+
+def _sa_random_move(problem, state, rng):
+    """Uniform move-type choice, then uniform endpoints; no greedy shortlist."""
+    groups, atoms = state.active_groups, state.active_atoms
+    active = set(groups)
+    missing = tuple(g for g in problem.groups if g not in active)
+    absent_atoms = tuple(a for a in range(problem.library.n_atoms) if a not in atoms)
+    removable_atoms = tuple(a for a in atoms if isinstance(problem.library, CandidateLibrary)
+                            or a != state.continuous.pivot_atom)
+    kinds = []
+    if len(groups) > 1:
+        kinds.append('drop_group')
+    if missing:
+        kinds.extend(('add_group', 'swap_group'))
+    if len(atoms) > 1 and removable_atoms:
+        kinds.append('drop_atom')
+    if absent_atoms:
+        kinds.append('add_atom')
+        if removable_atoms:
+            kinds.append('swap_atom')
+    if not kinds:
+        return None
+    choose = lambda seq: seq[int(rng.integers(len(seq)))]
+    kind = choose(kinds)
+    return MDLMove(kind,
+        group_out=choose(groups) if kind in ('drop_group', 'swap_group') else None,
+        group_in=choose(missing) if kind in ('add_group', 'swap_group') else None,
+        atom_out=choose(removable_atoms) if kind in ('drop_atom', 'swap_atom') else None,
+        atom_in=choose(absent_atoms) if kind in ('add_atom', 'swap_atom') else None)
+
+
+def optimize_fixed_dynamics_mdl_sa(
+    problem, *, quantizer, max_mdl_search_rounds=200, sa_options=None, **initialization,
+):
+    """Independent serial SA chains over jointly profiled, quantized models.
+
+    Each chain is initialized by the existing alternating search. All feasible
+    pure-law branches finish before cross-branch MDL selection. Temperatures
+    and stagnation thresholds are in bits (internal MDLScore.total is nats).
+    Proposal screening/profile fitting are asymmetric: this is heuristic SA,
+    not an exact Metropolis-Hastings posterior sampler or a global certificate.
+    """
+    from collections import deque
+    from operator import index
+
+    defaults = dict(n_chains=1, seed=20260918, initial_temperature_bits=10.0,
+                    final_temperature_bits=0.1, min_rounds=60, patience_rounds=40,
+                    improvement_abs_bits=0.1, improvement_rel_tol=1e-4,
+                    min_unique_proposals=5, warm_start_rounds=5,
+                    batch_probability=0.25, progress_interval=20)
+    supplied = {} if sa_options is None else dict(sa_options)
+    unknown = supplied.keys() - defaults.keys()
+    if unknown:
+        raise ValueError(f'Unknown SA options: {sorted(unknown)}')
+    options = {**defaults, **supplied}
+    for name in ('n_chains', 'min_rounds', 'patience_rounds', 'min_unique_proposals',
+                 'warm_start_rounds', 'progress_interval'):
+        value = options[name]
+        if isinstance(value, (bool, np.bool_)) or index(value) < (1 if name in
+                ('n_chains', 'patience_rounds', 'min_unique_proposals') else 0):
+            raise ValueError(f'Invalid SA {name}')
+    rounds = index(max_mdl_search_rounds)
+    if rounds < 0:
+        raise ValueError('max_mdl_search_rounds must be nonnegative')
+    t0, tf = options['initial_temperature_bits'], options['final_temperature_bits']
+    if not np.isfinite(t0) or not np.isfinite(tf) or not 0 < tf <= t0:
+        raise ValueError('SA temperatures must satisfy 0 < final <= initial')
+    for name in ('improvement_abs_bits', 'improvement_rel_tol', 'batch_probability'):
+        if not np.isfinite(options[name]) or options[name] < 0:
+            raise ValueError(f'Invalid SA {name}')
+    if options['batch_probability'] > 1:
+        raise ValueError('batch_probability must be <= 1')
+    init = dict(initial_groups=None, initial_atoms=None, max_nfev=120,
+                final_max_nfev=300, q_min=1, q_max=64, max_coordinate_passes=4)
+    init.update(initialization)
+    if isinstance(problem.library, CandidateLibrary) and init['initial_atoms'] is None:
+        return _run_candidate_branches(problem, optimize_fixed_dynamics_mdl_sa,
+            dict(problem=problem, quantizer=quantizer, max_mdl_search_rounds=rounds,
+                 sa_options=options, **init))
+
+    seeds = np.random.SeedSequence(options['seed']).spawn(options['n_chains'])
+    summaries, winner = [], None
+    for chain_id, child in enumerate(seeds):
+        chain_seed = int(child.generate_state(1)[0])
+        rng = np.random.default_rng(chain_seed)
+        warm = dict(init)
+        warm.pop('max_structural_outer', None)
+        warm.update(max_mdl_search_rounds=options['warm_start_rounds'], basin_seed=chain_seed)
+        if options['progress_interval']:
+            print(f'SA chain {chain_id+1}/{options["n_chains"]}: '
+                  f'initializing atoms={init["initial_atoms"]}, seed={chain_seed}', flush=True)
+        seed_result = optimize_fixed_dynamics_mdl_alternating(problem, quantizer=quantizer, **warm)
+        current = best = seed_result.best_state
+        history = list(seed_result.history)
+        trace = []
+        recent = deque(maxlen=options['patience_rounds'])
+        best_values = deque([best.mdl_upper.total_bits], maxlen=options['patience_rounds']+1)
+        stop_reason = 'max_rounds'
+        for step in range(rounds):
+            temperature = float(t0 * (tf / t0) ** (step / max(1, rounds-1)))
+            move = None
+            groups, atoms = current.active_groups, current.active_atoms
+            if rng.random() < options['batch_probability']:
+                screens = screen_fixed_theta_support_path(problem, current,
+                    max_candidates=3, include_beyond_boundary=1)
+                if screens:
+                    screen = screens[int(rng.integers(len(screens)))]
+                    groups = screen.active_groups
+                    move = MDLMove('drop_batch', group_out=screen.dropped_groups)
+            if move is None:
+                move = _sa_random_move(problem, current, rng)
+                if move is not None:
+                    groups, atoms = _apply_move(problem, current, move)
+            candidate = None
+            fit_diagnostics = {}
+            if move is not None:
+                # Deliberately bypass evaluate_*'s greedy lower-bound rejection:
+                # higher-DL feasible models must remain eligible for SA.
+                candidate = _build_joint_refined_state_fast(problem, groups, atoms,
+                    quantizer=quantizer, warm_theta=current.continuous.theta,
+                    warm_q=current.precision.q_upper, q_min=init['q_min'], q_max=init['q_max'],
+                    max_nfev=init['max_nfev'], max_coordinate_passes=init['max_coordinate_passes'],
+                    diagnostics=fit_diagnostics)
+            accepted, probability, delta = False, 0.0, None
+            status = ('no_proposal' if move is None else
+                      fit_diagnostics.get('status', 'no_feasible_quantized_witness'))
+            if candidate is not None:
+                delta = float(candidate.mdl_upper.total_bits-current.mdl_upper.total_bits)
+                probability = _sa_acceptance_probability(delta, temperature)
+                accepted = bool(rng.random() < probability)
+                status = 'accepted' if accepted else 'metropolis_rejected'
+                if accepted:
+                    old, current = current, candidate
+                    history.append(FixedDynamicsCompressionStep(
+                        sweep=step, move=move, old_mdl_upper=float(old.mdl_upper.total),
+                        new_mdl_upper=float(current.mdl_upper.total),
+                        certified_improvement=bool(current.mdl_upper.total < old.mdl_lower),
+                        phase='sa_expression' if 'atom' in move.kind else 'sa_structure',
+                        theta_relative_change=_theta_relative_change(old.continuous.theta, current.continuous.theta),
+                        n_exact_refits=1))
+                if candidate.mdl_upper.total < best.mdl_upper.total:
+                    best = candidate
+            recent.append((groups, atoms) if candidate is not None else None)
+            best_values.append(float(best.mdl_upper.total_bits))
+            trace.append(dict(round=step+1, temperature_bits=temperature,
+                move=None if move is None else move.label(), status=status,
+                candidate_bits=None if candidate is None else float(candidate.mdl_upper.total_bits),
+                delta_bits=delta, acceptance_probability=probability, accepted=accepted,
+                current_bits=float(current.mdl_upper.total_bits), best_bits=float(best.mdl_upper.total_bits)))
+            interval = options['progress_interval']
+            if interval and ((step+1) % interval == 0 or step == 0):
+                print(f'SA chain {chain_id+1}/{options["n_chains"]} round {step+1}/{rounds}: '
+                      f'T={temperature:.3g} bits, current={current.mdl_upper.total_bits:.3f}, '
+                      f'best={best.mdl_upper.total_bits:.3f}, {status}', flush=True)
+            # Failures alone, or repeating one support, do not establish stability.
+            if step+1 >= options['min_rounds'] and len(best_values) == options['patience_rounds']+1:
+                threshold = max(options['improvement_abs_bits'],
+                                options['improvement_rel_tol'] * abs(best_values[0]))
+                if (best_values[0]-best_values[-1] <= threshold
+                        and len({key for key in recent if key is not None}) >= options['min_unique_proposals']):
+                    stop_reason = 'best_mdl_stable'
+                    break
+        witness = best.precision.witness
+        summary = dict(chain_id=chain_id, seed=chain_seed, rounds=len(trace), stop_reason=stop_reason,
+            options=dict(options), max_rounds=rounds,
+            warm_start_rounds=seed_result.outer_iterations,
+            best_mdl_bits=float(best.mdl_upper.total_bits), current_mdl_bits=float(current.mdl_upper.total_bits),
+            best_groups=best.active_groups, best_atoms=best.active_atoms,
+            best_theta=tuple(float(x) for x in witness.theta),
+            best_amplitudes=tuple(float(x) for x in witness.amplitudes),
+            feasible_proposals=sum(row['candidate_bits'] is not None for row in trace),
+            accepted_uphill=sum(row['accepted'] and row['delta_bits'] > 0 for row in trace),
+            trace=tuple(trace))
+        summaries.append(summary)
+        result = replace(seed_result, best_state=best, history=tuple(history),
+            structural_history=tuple(h for h in history if h.phase in ('structural_batch', 'structural_polish', 'sa_structure')),
+            expression_history=tuple(h for h in history if h.phase in ('expression', 'sa_expression')),
+            sweeps_completed=len(trace), outer_iterations=len(trace), search_strategy='simulated_annealing')
+        if winner is None or best.mdl_upper.total < winner.best_state.mdl_upper.total:
+            winner = result
+    return replace(winner, sa_chains=tuple(summaries))
+
+
 __all__ = [
+    "optimize_fixed_dynamics_mdl_sa",
     "FixedDynamicsHypothesis",
     "FixedDynamicsMDLProblem",
     "MDLMove",

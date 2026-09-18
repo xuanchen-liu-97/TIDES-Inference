@@ -32,6 +32,8 @@ try:  # package form
         FixedDynamicsMDLProblem,
         optimize_fixed_dynamics_mdl,
         optimize_fixed_dynamics_mdl_alternating,
+        _resolve_mdl_search_rounds,
+        optimize_fixed_dynamics_mdl_sa,
     )
 except ImportError:  # flat-file form
     from step2_edge_space_reconstruction import EdgeSpaceFieldFamily
@@ -42,6 +44,8 @@ except ImportError:  # flat-file form
         FixedDynamicsMDLProblem,
         optimize_fixed_dynamics_mdl,
         optimize_fixed_dynamics_mdl_alternating,
+        _resolve_mdl_search_rounds,
+        optimize_fixed_dynamics_mdl_sa,
     )
 
 try:
@@ -306,8 +310,10 @@ def compress_fixed_dynamics(
     basin_local_max_nfev: int = 50,
     basin_initial_theta: Optional[FloatArray] = None,
     search_strategy: str = "alternating_profiled",
+    sa_options: Optional[Mapping[str, Any]] = None,
     max_sweeps: int = 50,
-    max_structural_outer: int = 8,
+    max_mdl_search_rounds: Optional[int] = None,
+    max_structural_outer: Optional[int] = None,
     structural_joint_candidates: int = 3,
     structural_beyond_boundary: int = 1,
     structural_polish_sweeps: int = 4,
@@ -333,8 +339,20 @@ def compress_fixed_dynamics(
     problem, then shortlisted supports are re-profiled jointly in (W, Theta)
     before MDL acceptance.
 
+    ``max_mdl_search_rounds`` sets the main alternating-search loop limit
+    (default 8). Local polish, expression search, and inner numerical iterations
+    keep their separate budgets. ``max_structural_outer`` remains an alias for
+    older callers; conflicting values raise ValueError. The legacy search still
+    uses ``max_sweeps``; in alternating mode only its zero value disables all
+    compression phases, preserving the existing smoke-test convention.
+
     ``search_strategy="legacy"`` retains the earlier one-move-at-a-time search
     for regression testing.
+
+    ``search_strategy="simulated_annealing"`` uses independent serial SA chains
+    configured by ``sa_options``. The main budget then counts SA proposals per
+    chain and per feasible pure-law branch, excluding the separately configured
+    greedy warm start. This is heuristic optimization, not posterior sampling.
 
     Compact blocks are the default. The current structural least-squares
     matrix is still solved by SVD; this is not an iterative-solver switch.
@@ -343,6 +361,12 @@ def compress_fixed_dynamics(
     is local to this call and does not change tolerances or solver algorithms.
     """
 
+    if (str(search_strategy).lower() in {"simulated_annealing", "sa"}
+            and max_mdl_search_rounds is None and max_structural_outer is None):
+        max_mdl_search_rounds = 200
+    max_mdl_search_rounds = _resolve_mdl_search_rounds(
+        max_mdl_search_rounds, max_structural_outer,
+    )
     problem = build_fixed_dynamics_problem(
         field_family, mdl_library=mdl_library, block_backend=block_backend,
         cache_linear_algebra=cache_linear_algebra,
@@ -351,13 +375,30 @@ def compress_fixed_dynamics(
         quantizer = UniformDyadicQuantizer(bound=float(quantizer_bound))
 
     strategy = str(search_strategy).lower()
-    if strategy in {"alternating_profiled", "alternating", "dynamics_first"}:
+    if strategy in {"simulated_annealing", "sa"}:
+        search = optimize_fixed_dynamics_mdl_sa(
+            problem, quantizer=quantizer, max_mdl_search_rounds=max_mdl_search_rounds,
+            sa_options=sa_options, initial_groups=initial_groups, initial_atoms=initial_atoms,
+            n_basin_hops=n_basin_hops, basin_seed=basin_seed,
+            basin_sigma_min=basin_sigma_min, basin_sigma_max=basin_sigma_max,
+            basin_local_max_nfev=basin_local_max_nfev, basin_initial_theta=basin_initial_theta,
+            structural_joint_candidates=structural_joint_candidates,
+            structural_beyond_boundary=structural_beyond_boundary,
+            structural_polish_sweeps=structural_polish_sweeps,
+            max_expression_sweeps=max_expression_sweeps, theta_stability_tol=theta_stability_tol,
+            q_min=q_min, q_max=q_max, max_nfev=max_nfev, final_max_nfev=final_max_nfev,
+            max_coordinate_passes=max_coordinate_passes,
+            polish_group_drops=min(top_group_drops, 3),
+            polish_group_adds=min(top_group_adds, 3), polish_group_swaps=min(top_group_swaps, 3),
+            top_atom_drops=top_atom_drops, top_atom_adds=top_atom_adds, top_atom_swaps=top_atom_swaps,
+        )
+    elif strategy in {"alternating_profiled", "alternating", "dynamics_first"}:
         # Preserve the old smoke-test meaning of max_sweeps=0: discover a
         # feasible shared-law basin but do not compress the representation.
         if int(max_sweeps) == 0:
             structural_outer = structural_polish = expression_sweeps = 0
         else:
-            structural_outer = max_structural_outer
+            structural_outer = max_mdl_search_rounds
             structural_polish = structural_polish_sweeps
             expression_sweeps = max_expression_sweeps
 
@@ -372,7 +413,7 @@ def compress_fixed_dynamics(
             basin_sigma_max=basin_sigma_max,
             basin_local_max_nfev=basin_local_max_nfev,
             basin_initial_theta=basin_initial_theta,
-            max_structural_outer=structural_outer,
+            max_mdl_search_rounds=structural_outer,
             structural_joint_candidates=structural_joint_candidates,
             structural_beyond_boundary=structural_beyond_boundary,
             structural_polish_sweeps=structural_polish,
@@ -416,7 +457,7 @@ def compress_fixed_dynamics(
         )
     else:
         raise ValueError(
-            "search_strategy must be 'alternating_profiled' or 'legacy'."
+            "search_strategy must be 'alternating_profiled', 'simulated_annealing', or 'legacy'."
         )
 
     state = search.best_state
@@ -483,6 +524,7 @@ def compress_fixed_dynamics(
             "n_active_atoms": int(len(state.active_atoms)),
             "n_mdl_moves": int(len(search.history)),
             "search_strategy": getattr(search, "search_strategy", strategy),
+            "sa_chains": search.sa_chains,
             "n_structural_moves": int(len(getattr(search, "structural_history", ()))),
             "n_expression_moves": int(len(getattr(search, "expression_history", ()))),
             "theta_anchor_to_final_relative_change": (
@@ -499,6 +541,8 @@ def compress_fixed_dynamics(
                 )
             ),
             "quantizer_bound": float(quantizer.bound),
+            "initial_precision_diagnostics": search.initial_state.precision.diagnostics,
+            "precision_diagnostics": state.precision.diagnostics,
             "precision_status": "feasible_upper_bound",
         },
     )

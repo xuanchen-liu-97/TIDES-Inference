@@ -22,6 +22,10 @@ category seed.  Consequently category locking cannot masquerade as structural
 necessity during in3.
 
 No repair and no birth are permitted in this module.
+
+The first-party particle estimator delegates every fixed-Theta free-W fit to
+``step3func_physical_profiling``.  Exact/specialized basin computations can
+still implement the small ``BasinBackend`` interface.
 """
 
 from __future__ import annotations
@@ -30,10 +34,20 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Hashable, Mapping, Protocol, Sequence, Literal
 import math
 
+import numpy as np
+
 try:
     from .step3in1_weight_category_distribution import ProfiledState
+    from .step3func_physical_profiling import (
+        FixedDynamicsProblem,
+        profile_free_weights_at_theta,
+    )
 except ImportError:
     from step3in1_weight_category_distribution import ProfiledState
+    from step3func_physical_profiling import (
+        FixedDynamicsProblem,
+        profile_free_weights_at_theta,
+    )
 
 Coordinate = Hashable
 
@@ -169,6 +183,200 @@ class BatchDeletionBasinBackend(Protocol):
 
     def audit_single_deletions(self, state: ProfiledState) -> BasinDeletionAudit:
         ...
+
+
+# ---------------------------------------------------------------------------
+# First-party free-W particle basin computation
+# ---------------------------------------------------------------------------
+
+
+class PhysicalBasinParticleComputation:
+    """Reference high-dimensional basin estimator using physical profiling.
+
+    A fixed weighted Theta particle cloud represents the chosen dynamics-space
+    measure.  For every particle and support S this class evaluates
+
+        rho_free(S, Theta) = min_W rho(S, W, Theta)
+
+    by calling ``profile_free_weights_at_theta``.  Parent and every
+    single-deletion child are therefore evaluated on exactly the same particle
+    cloud, which preserves the required free-W basin nesting semantics.
+
+    This class is intentionally only a basin *computation*.  It does not choose
+    deletions, define a cliff rule, or inspect weight categories.
+    """
+
+    def __init__(
+        self,
+        problem: FixedDynamicsProblem,
+        theta_particles,
+        *,
+        particle_weights=None,
+        sample_id: Hashable | None = None,
+        min_effective_sample_size: float = 0.0,
+    ) -> None:
+        self.problem = problem
+        particles = np.asarray(theta_particles, dtype=float)
+        if particles.ndim != 2:
+            raise ValueError("theta_particles must be a 2D array.")
+        if particles.shape[0] < 1:
+            raise ValueError("theta_particles must contain at least one particle.")
+        if particles.shape[1] != problem.n_library_atoms:
+            raise ValueError(
+                "theta_particles second dimension must match the Step-3 "
+                "interaction-library dimension."
+            )
+        if not np.all(np.isfinite(particles)):
+            raise ValueError("theta_particles must be finite.")
+
+        if particle_weights is None:
+            weights = np.full(particles.shape[0], 1.0 / particles.shape[0])
+        else:
+            weights = np.asarray(particle_weights, dtype=float).reshape(-1)
+            if weights.size != particles.shape[0]:
+                raise ValueError("particle_weights has the wrong length.")
+            if np.any(~np.isfinite(weights)) or np.any(weights < 0.0):
+                raise ValueError("particle_weights must be finite and nonnegative.")
+            total = float(weights.sum())
+            if total <= 0.0:
+                raise ValueError("particle_weights must have positive total mass.")
+            weights = weights / total
+
+        self.theta_particles = particles
+        self.particle_weights = weights
+        self.sample_id = (
+            ("physical_theta_particles", id(self))
+            if sample_id is None
+            else sample_id
+        )
+        self.min_effective_sample_size = float(min_effective_sample_size)
+        if (
+            not math.isfinite(self.min_effective_sample_size)
+            or self.min_effective_sample_size < 0.0
+        ):
+            raise ValueError("min_effective_sample_size must be finite and nonnegative.")
+
+        self._effective_sample_size = float(
+            1.0 / np.sum(self.particle_weights * self.particle_weights)
+        )
+        self._mask_cache: dict[frozenset[Coordinate], np.ndarray] = {}
+
+    def _feasible_mask(self, support: frozenset[Coordinate]) -> np.ndarray:
+        support = frozenset(support)
+        cached = self._mask_cache.get(support)
+        if cached is not None:
+            return cached
+
+        if not support:
+            # Null structural model predicts zero interaction contribution.
+            feasible = bool(
+                1.0
+                <= self.problem.uncertainty_floor
+                * (1.0 + 100.0 * np.finfo(float).eps)
+            )
+            mask = np.full(self.theta_particles.shape[0], feasible, dtype=bool)
+        else:
+            mask = np.zeros(self.theta_particles.shape[0], dtype=bool)
+            for i, theta in enumerate(self.theta_particles):
+                _, profile = profile_free_weights_at_theta(
+                    self.problem,
+                    support,
+                    theta,
+                )
+                mask[i] = bool(profile.feasible)
+
+        self._mask_cache[support] = mask
+        return mask
+
+    def _estimate_from_mask(
+        self,
+        mask: np.ndarray,
+        *,
+        support: frozenset[Coordinate],
+    ) -> BasinMassEstimate:
+        indicators = np.asarray(mask, dtype=float)
+        mass = float(self.particle_weights @ indicators)
+        variance = float(
+            np.sum(
+                (self.particle_weights ** 2)
+                * (indicators - mass) ** 2
+            )
+        )
+        standard_error = float(np.sqrt(max(variance, 0.0)))
+
+        status: BasinMassStatus = "ok"
+        if self._effective_sample_size < self.min_effective_sample_size:
+            status = "inconclusive"
+
+        return BasinMassEstimate(
+            mass=mass,
+            status=status,
+            standard_error=standard_error,
+            effective_sample_size=self._effective_sample_size,
+            sample_id=self.sample_id,
+            metadata={
+                "physical_profiling": True,
+                "n_particles": int(mask.size),
+                "n_feasible_particles": int(np.count_nonzero(mask)),
+                "support_size": len(support),
+            },
+        )
+
+    def basin_mass(self, state: ProfiledState) -> BasinMassEstimate:
+        support = frozenset(state.support)
+        return self._estimate_from_mask(
+            self._feasible_mask(support),
+            support=support,
+        )
+
+    def audit_single_deletions(self, state: ProfiledState) -> BasinDeletionAudit:
+        support = frozenset(state.support)
+        parent_mask = self._feasible_mask(support)
+        parent_estimate = self._estimate_from_mask(
+            parent_mask,
+            support=support,
+        )
+        parent_mass = float(parent_estimate.mass or 0.0)
+
+        records: list[DeletionDiagnostic] = []
+        child_estimates: dict[Coordinate, BasinMassEstimate] = {}
+
+        for coordinate in support:
+            child_support = frozenset(set(support) - {coordinate})
+            child_mask = self._feasible_mask(child_support)
+            child_estimate = self._estimate_from_mask(
+                child_mask,
+                support=child_support,
+            )
+            child_estimates[coordinate] = child_estimate
+            child_mass = float(child_estimate.mass or 0.0)
+            retention = 0.0 if parent_mass <= 0.0 else child_mass / parent_mass
+
+            records.append(
+                DeletionDiagnostic(
+                    coordinate=coordinate,
+                    parent_mass=parent_mass,
+                    child_mass=child_mass,
+                    retention=float(retention),
+                    metadata={
+                        "physical_profiling": True,
+                        "common_theta_particles": True,
+                    },
+                )
+            )
+
+        records.sort(key=lambda d: d.retention, reverse=True)
+        return BasinDeletionAudit(
+            parent_mass=parent_mass,
+            deletions=tuple(records),
+            parent_estimate=parent_estimate,
+            child_estimates=child_estimates,
+            metadata={
+                "physical_profiling": True,
+                "sample_id": self.sample_id,
+                "effective_sample_size": self._effective_sample_size,
+            },
+        )
 
 
 StopRule = callable
@@ -710,6 +918,7 @@ __all__ = [
     "In3Result",
     "BasinBackend",
     "BatchDeletionBasinBackend",
+    "PhysicalBasinParticleComputation",
     "ConditionalBasinBackend",
     "inherited_deletion_seed",
     "best_retention_selector",

@@ -25,6 +25,10 @@ tested without changing the validated core.
 
 This module intentionally does not implement E -> E-1 compression. That is the
 exclusive responsibility of Step 3 inner stage 3.
+
+Shared numerical fitting and conditional-LS geometry are delegated to
+``step3func_physical_profiling``; this file retains only the reversible
+structural-exploration logic and coverage semantics.
 """
 
 from __future__ import annotations
@@ -36,8 +40,18 @@ import random
 
 try:
     from .step3in1_weight_category_distribution import ProfiledState, In1InfeasibleError
+    from .step3func_physical_profiling import (
+        FixedDynamicsProblem,
+        conditional_ls_repair_gain,
+        profile_free_weights_and_dynamics,
+    )
 except ImportError:
     from step3in1_weight_category_distribution import ProfiledState, In1InfeasibleError
+    from step3func_physical_profiling import (
+        FixedDynamicsProblem,
+        conditional_ls_repair_gain,
+        profile_free_weights_and_dynamics,
+    )
 
 Coordinate = Hashable
 
@@ -183,6 +197,233 @@ class StructuralExplorationBackend(Protocol):
         set to irreversible in3 compression.
         """
         ...
+
+
+# ---------------------------------------------------------------------------
+# First-party physical-profiling implementation
+# ---------------------------------------------------------------------------
+
+
+ReplacementSelector = Callable[
+    [
+        ProfiledState,
+        Sequence[tuple[RepairProposal, ProfiledState]],
+        Sequence[In2Move],
+        random.Random,
+    ],
+    int | None,
+]
+CoverageAssessor = Callable[
+    [
+        ProfiledState,
+        Sequence[In2Move],
+        Sequence[frozenset[Coordinate]],
+    ],
+    bool | CoverageAssessment,
+]
+
+
+class PhysicalStructuralComputation:
+    """Destroy-repair computation using the shared physical profiler.
+
+    Numerical responsibilities are delegated to
+    ``step3func_physical_profiling``:
+
+    * the destroyed support is re-profiled with free structural amplitudes;
+    * inactive repair directions are ranked by the conditional-LS gain G;
+    * an E-preserving replacement seed is jointly re-profiled in (W, Theta).
+
+    Navigation and phase-boundary decisions remain separate strategy choices.
+    By default a feasible replacement is selected uniformly at random (never by
+    local MDL or residual depth), while coverage is *not* certified unless an
+    explicit ``coverage_assessor`` is supplied.
+    """
+
+    def __init__(
+        self,
+        problem: FixedDynamicsProblem,
+        *,
+        active_atoms: Sequence[int],
+        candidate_coordinates: Sequence[Coordinate] | None = None,
+        shortlist_per_removal: int = 4,
+        global_tail_per_removal: int = 2,
+        max_nfev: int = 120,
+        replacement_selector: ReplacementSelector | None = None,
+        coverage_assessor: CoverageAssessor | None = None,
+    ) -> None:
+        self.problem = problem
+        self.active_atoms = tuple(sorted(set(int(a) for a in active_atoms)))
+        if not self.active_atoms:
+            raise ValueError("active_atoms must be non-empty.")
+        self.candidate_coordinates = tuple(
+            problem.coordinates
+            if candidate_coordinates is None
+            else candidate_coordinates
+        )
+        unknown = set(self.candidate_coordinates) - set(problem.coordinates)
+        if unknown:
+            raise ValueError(
+                "candidate_coordinates contains unknown entries: "
+                f"{sorted(map(repr, unknown))}"
+            )
+        self.shortlist_per_removal = int(shortlist_per_removal)
+        self.global_tail_per_removal = int(global_tail_per_removal)
+        self.max_nfev = int(max_nfev)
+        if self.shortlist_per_removal < 0 or self.global_tail_per_removal < 0:
+            raise ValueError("Proposal shortlist/tail sizes must be nonnegative.")
+        if self.max_nfev < 1:
+            raise ValueError("max_nfev must be >= 1.")
+        self.replacement_selector = replacement_selector
+        self.coverage_assessor = coverage_assessor
+
+    def replacement_proposals(
+        self,
+        state: ProfiledState,
+        *,
+        rng: random.Random,
+    ) -> Iterable[RepairProposal]:
+        support = frozenset(state.support)
+        inactive = tuple(g for g in self.candidate_coordinates if g not in support)
+        if not support or not inactive:
+            return ()
+
+        proposals: list[RepairProposal] = []
+        seen: set[tuple[Coordinate, Coordinate]] = set()
+
+        for removed in support:
+            destroyed = frozenset(set(support) - {removed})
+            if not destroyed:
+                continue
+
+            destroyed_profile = profile_free_weights_and_dynamics(
+                self.problem,
+                destroyed,
+                active_atoms=self.active_atoms,
+                warm_theta=state.theta,
+                max_nfev=self.max_nfev,
+                compute_linear_relaxation=False,
+                include_default_start=True,
+            )
+            theta = destroyed_profile.fit.theta
+
+            scored = [
+                conditional_ls_repair_gain(
+                    self.problem,
+                    destroyed,
+                    candidate,
+                    theta,
+                )
+                for candidate in inactive
+            ]
+            scored.sort(key=lambda item: item.gain, reverse=True)
+
+            chosen = list(scored[: self.shortlist_per_removal])
+            remainder = scored[self.shortlist_per_removal :]
+            if self.global_tail_per_removal and remainder:
+                chosen.extend(
+                    rng.sample(
+                        remainder,
+                        k=min(self.global_tail_per_removal, len(remainder)),
+                    )
+                )
+
+            for gain in chosen:
+                key = (removed, gain.coordinate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                proposals.append(
+                    RepairProposal(
+                        removed=removed,
+                        added=gain.coordinate,
+                        score=float(gain.gain),
+                        metadata={
+                            "physical_profiling": True,
+                            "destroyed_relative_residual": float(
+                                destroyed_profile.fit.relative_residual
+                            ),
+                            "repair_residualized_norm_sq": float(
+                                gain.residualized_norm_sq
+                            ),
+                            "repair_score_defined": bool(gain.score_defined),
+                        },
+                    )
+                )
+
+        proposals.sort(key=lambda p: p.score, reverse=True)
+        return tuple(proposals)
+
+    def build_replacement_seed(
+        self,
+        state: ProfiledState,
+        proposal: RepairProposal,
+    ) -> ProfiledState:
+        support = (frozenset(state.support) - {proposal.removed}) | {proposal.added}
+        profiled = profile_free_weights_and_dynamics(
+            self.problem,
+            support,
+            active_atoms=self.active_atoms,
+            warm_theta=state.theta,
+            max_nfev=self.max_nfev,
+            compute_linear_relaxation=False,
+            include_default_start=True,
+        )
+
+        # A replacement invalidates old equality-sharing assumptions.  Release
+        # categories completely before handing the seed to in1.
+        ordered = tuple(profiled.support)
+        categories = {
+            g: ("released", i)
+            for i, g in enumerate(ordered)
+        }
+
+        return ProfiledState(
+            support=frozenset(profiled.support),
+            categories=categories,
+            # This value is intentionally stale: run_in2 immediately calls in1,
+            # whose category scorer replaces it before the candidate can be used.
+            description_length=float(state.description_length),
+            relative_residual=float(profiled.fit.relative_residual),
+            weights=dict(profiled.weights),
+            theta=profiled.fit.theta.copy(),
+            metadata={
+                **dict(state.metadata),
+                "physical_profiling": True,
+                "in2_replacement_seed": True,
+                "description_length_stale": True,
+                "removed": proposal.removed,
+                "added": proposal.added,
+            },
+        )
+
+    def choose_replacement(
+        self,
+        current: ProfiledState,
+        candidates: Sequence[tuple[RepairProposal, ProfiledState]],
+        history: Sequence[In2Move],
+        *,
+        rng: random.Random,
+    ) -> int | None:
+        if not candidates:
+            return None
+        if self.replacement_selector is not None:
+            return self.replacement_selector(current, candidates, history, rng)
+        # Reference navigation is deliberately non-greedy with respect to both
+        # residual depth and description length.
+        return int(rng.randrange(len(candidates)))
+
+    def coverage_saturated(
+        self,
+        state: ProfiledState,
+        history: Sequence[In2Move],
+        visited_supports: Sequence[frozenset[Coordinate]],
+    ) -> bool | CoverageAssessment:
+        if self.coverage_assessor is None:
+            return CoverageAssessment(
+                saturated=False,
+                reason="no_explicit_coverage_assessor",
+            )
+        return self.coverage_assessor(state, history, visited_supports)
 
 
 In1RelaxFn = Callable[[ProfiledState], ProfiledState]
@@ -521,6 +762,9 @@ __all__ = [
     "CoverageCheck",
     "In2Result",
     "StructuralExplorationBackend",
+    "ReplacementSelector",
+    "CoverageAssessor",
+    "PhysicalStructuralComputation",
     "In1RelaxFn",
     "CapacityDiagnostic",
     "BirthSeedBuilder",

@@ -14,17 +14,32 @@ The category partition remains reversible. When S changes later, the caller
 must allow reassignment / split / merge-split so that an old partition cannot
 lock a new topology.
 
-This module is an orchestration layer. The model-specific VarPro / MDL
-numerics are supplied by CategoryBackend so that the already-tested TIDES
-solver can be reused without changing its numerical method.
+The shared continuous calculations are delegated to
+``step3func_physical_profiling``.  Description-length definitions and category
+proposal rules remain separate from the physical profiler.  ``CategoryBackend``
+is retained as an interface for custom/validated implementations, while
+``PhysicalCategoryComputation`` is the first-party implementation.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Hashable, Iterable, Mapping, Protocol
+from typing import Any, Callable, Hashable, Iterable, Mapping, Protocol
 import math
 import random
+
+try:
+    from .step3func_physical_profiling import (
+        FixedDynamicsProblem,
+        CategoryProfile,
+        profile_category_weights_and_dynamics,
+    )
+except ImportError:
+    from step3func_physical_profiling import (
+        FixedDynamicsProblem,
+        CategoryProfile,
+        profile_category_weights_and_dynamics,
+    )
 
 Coordinate = Hashable
 CategoryLabel = Hashable
@@ -131,6 +146,126 @@ class CategoryBackend(Protocol):
         rng: random.Random,
     ) -> Iterable[CategoryMove]:
         ...
+
+
+# ---------------------------------------------------------------------------
+# First-party physical-profiling implementation
+# ---------------------------------------------------------------------------
+
+
+DescriptionLengthScorer = Callable[
+    [frozenset[Coordinate], Mapping[Coordinate, CategoryLabel], CategoryProfile],
+    float,
+]
+CategoryProposalFn = Callable[
+    [ProfiledState, str, random.Random],
+    Iterable[CategoryMove],
+]
+
+
+class PhysicalCategoryComputation:
+    """Category-stage computation using ``step3func_physical_profiling``.
+
+    The class deliberately keeps the two conceptually different pieces
+    separate:
+
+    * physical feasibility / (W, Theta) fitting is performed here by the shared
+      Step-3 profiling module;
+    * description length and category proposals remain injected model/search
+      definitions.
+
+    Consequently in1 contains no duplicate VarPro, SVD, or least-squares code.
+    """
+
+    def __init__(
+        self,
+        problem: FixedDynamicsProblem,
+        *,
+        active_atoms: Iterable[int],
+        description_length_scorer: DescriptionLengthScorer,
+        proposal_fn: CategoryProposalFn | None = None,
+        max_nfev: int = 250,
+        compute_linear_relaxation: bool = False,
+    ) -> None:
+        self.problem = problem
+        self.active_atoms = tuple(sorted(set(int(a) for a in active_atoms)))
+        if not self.active_atoms:
+            raise ValueError("active_atoms must be non-empty.")
+        self.description_length_scorer = description_length_scorer
+        self.proposal_fn = proposal_fn
+        self.max_nfev = int(max_nfev)
+        if self.max_nfev < 1:
+            raise ValueError("max_nfev must be >= 1.")
+        self.compute_linear_relaxation = bool(compute_linear_relaxation)
+
+    def profile(
+        self,
+        support: frozenset[Coordinate],
+        categories: Mapping[Coordinate, CategoryLabel],
+        *,
+        warm_start: ProfiledState | None = None,
+    ) -> ProfiledState:
+        warm_theta = None if warm_start is None else warm_start.theta
+        profiled = profile_category_weights_and_dynamics(
+            self.problem,
+            support,
+            categories,
+            active_atoms=self.active_atoms,
+            warm_theta=warm_theta,
+            max_nfev=self.max_nfev,
+            compute_linear_relaxation=self.compute_linear_relaxation,
+            include_default_start=True,
+        )
+
+        fit = profiled.fit
+        if not fit.feasible_witness:
+            raise In1InfeasibleError(
+                "Fixed-(J,S,c) physical profile lies outside B_epsilon: "
+                f"rho={fit.relative_residual:.6e}, "
+                f"eps={fit.uncertainty_floor:.6e}."
+            )
+
+        dl = float(
+            self.description_length_scorer(
+                frozenset(profiled.support),
+                dict(profiled.categories),
+                profiled,
+            )
+        )
+        if not math.isfinite(dl):
+            raise ValueError(
+                "description_length_scorer must return a finite value for a "
+                "feasible physical profile."
+            )
+
+        return ProfiledState(
+            support=frozenset(profiled.support),
+            categories=dict(profiled.categories),
+            description_length=dl,
+            relative_residual=float(fit.relative_residual),
+            weights=dict(profiled.weights),
+            theta=fit.theta.copy(),
+            metadata={
+                **({} if warm_start is None else dict(warm_start.metadata)),
+                "physical_profiling": True,
+                "n_categories": len(profiled.category_order),
+                "category_values": dict(profiled.category_values),
+                "optimizer_nfev": int(fit.optimizer_nfev),
+                "optimizer_success": bool(fit.optimizer_success),
+                "relaxed_relative_residual": float(fit.relaxed_relative_residual),
+            },
+        )
+
+    def propose(
+        self,
+        state: ProfiledState,
+        move_kind: str,
+        *,
+        rng: random.Random,
+    ) -> Iterable[CategoryMove]:
+        if self.proposal_fn is None:
+            return ()
+        return self.proposal_fn(state, move_kind, rng)
 
 
 def _validate_partition(
@@ -303,6 +438,9 @@ __all__ = [
     "In1Config",
     "In1Result",
     "CategoryBackend",
+    "DescriptionLengthScorer",
+    "CategoryProposalFn",
+    "PhysicalCategoryComputation",
     "run_weight_category_distribution",
     "run_in1",
 ]

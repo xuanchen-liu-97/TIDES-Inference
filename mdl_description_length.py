@@ -1,49 +1,65 @@
-"""Conditional MDL accounting for TIDES Step 3 physical compression.
+"""Discrete representation description length for TIDES Step 3.
 
-For a physical hypothesis H and interaction library Psi supplied as side
-information, Step 3 scores an observationally feasible physical representation
-through
+The active discrete representation is (J, S, c): dynamics support J,
+structural support S, and the unlabeled weight-category partition c.
+For a physically feasible representation,
 
-    L_MDL = L_struct + L_expr + L_prec.
+    L_rep(J,S,c) = L_J(J) + L_S(S|J) + L_c(c|S).
 
-Observational admissibility is enforced by the Step-2 uncertainty ball.  For
-convenience this module keeps an observation term with the hard convention
-
-    L_obs = 0      if rho <= epsilon,
-            +inf   otherwise.
-
-The public accounting routines are hypothesis-agnostic.  A hypothesis-specific
-search supplies exactly the structural support blocks, independent interaction
-objects, free numerical parameter count, residual, and precision depth implied
-by that representation.
-
-All code lengths are returned in nats.
+Continuous W and Theta are not assigned a q-bit precision penalty here.
+Feasibility is handled by physical profiling; continuous robustness is handled
+separately by basin geometry.  All code lengths are returned in nats.
 """
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import floor, lgamma, log, log1p
-from typing import Callable, Hashable, Optional, Sequence
+from math import lgamma, log
+from typing import Any, Callable, Hashable, Mapping, Sequence
 
-import numpy as np
+Coordinate = Hashable
+CategoryLabel = Hashable
+
+
+def log_choose(n: int, k: int) -> float:
+    """log binomial(n,k), in nats."""
+    n, k = int(n), int(k)
+    if n < 0:
+        raise ValueError("n must be non-negative.")
+    if k < 0 or k > n:
+        raise ValueError("Require 0 <= k <= n.")
+    if k == 0 or k == n:
+        return 0.0
+    k = min(k, n-k)
+    return float(lgamma(n+1.0) - lgamma(k+1.0) - lgamma(n-k+1.0))
+
+
+def uniform_model_index_code_nats(n_models: int) -> float:
+    """Uniform code for one member of a predeclared finite J-family."""
+    n_models = int(n_models)
+    if n_models < 1:
+        raise ValueError("n_models must be >= 1.")
+    return float(log(n_models))
+
+
+def subset_support_code_nats(candidate_count: int, active_count: int) -> float:
+    """Two-part support code: log(M+1) + log binomial(M,E)."""
+    M, E = int(candidate_count), int(active_count)
+    if M < 0:
+        raise ValueError("candidate_count must be non-negative.")
+    if E < 0 or E > M:
+        raise ValueError("Require 0 <= active_count <= candidate_count.")
+    return float(log(M+1.0) + log_choose(M, E))
 
 
 @dataclass(frozen=True)
 class StructuralSupportBlock:
-    """One structural support block encoded under physical hypothesis H.
-
-    Examples include the baseline edge support W^(1) and each temporal-change
-    support supp(Delta W^(k)) under H_FD.
-    """
-
+    """One independently encoded structural support block."""
     candidate_count: int
     active_count: int
-    label: Optional[Hashable] = None
+    label: Hashable | None = None
 
     def __post_init__(self) -> None:
-        M = int(self.candidate_count)
-        E = int(self.active_count)
+        M, E = int(self.candidate_count), int(self.active_count)
         if M < 0:
             raise ValueError("candidate_count must be non-negative.")
         if E < 0 or E > M:
@@ -52,420 +68,197 @@ class StructuralSupportBlock:
         object.__setattr__(self, "active_count", E)
 
 
-# Backward-compatible name used by earlier notebooks.
 TemporalSupportBlock = StructuralSupportBlock
 
 
-@dataclass(frozen=True)
-class PolynomialLibrary:
-    """Side-information specification for a polynomial interaction library."""
-
-    atom_degrees: tuple[int, ...]
-    max_degree: int
-
-    def __post_init__(self) -> None:
-        degrees = tuple(int(d) for d in self.atom_degrees)
-        P = int(self.max_degree)
-        if P < 1:
-            raise ValueError("max_degree must be >= 1.")
-        if not degrees:
-            raise ValueError("PolynomialLibrary must contain at least one atom.")
-        if any(d < 1 or d > P for d in degrees):
-            raise ValueError("Each atom degree must lie in 1,...,max_degree.")
-        object.__setattr__(self, "atom_degrees", degrees)
-        object.__setattr__(self, "max_degree", P)
-
-    @property
-    def n_atoms(self) -> int:
-        return len(self.atom_degrees)
-
-    def count_up_to_degree(self, p: int) -> int:
-        return sum(d <= int(p) for d in self.atom_degrees)
-
-    @property
-    def search_complexities(self) -> tuple[int, ...]:
-        return self.atom_degrees
+def structural_support_code_nats(
+    blocks: Sequence[StructuralSupportBlock],
+) -> tuple[float, tuple[float, ...]]:
+    components = tuple(
+        subset_support_code_nats(b.candidate_count, b.active_count)
+        for b in blocks
+    )
+    return float(sum(components)), components
 
 
-@dataclass(frozen=True)
-class CandidateLibrary:
-    """Fixed dictionary supplied as side information, including atom parameters.
+def _partition_sizes(
+    support: Sequence[Coordinate] | frozenset[Coordinate],
+    categories: Mapping[Coordinate, CategoryLabel],
+) -> tuple[int, tuple[int, ...]]:
+    support = frozenset(support)
+    keys = frozenset(categories)
+    if keys != support:
+        missing, extra = support-keys, keys-support
+        raise ValueError(
+            "Category assignment must cover exactly the active support. "
+            f"missing={sorted(map(repr, missing))}, extra={sorted(map(repr, extra))}"
+        )
+    E = len(support)
+    if E == 0:
+        return 0, ()
+    counts: dict[CategoryLabel, int] = {}
+    for g in support:
+        label = categories[g]
+        counts[label] = counts.get(label, 0) + 1
+    sizes = tuple(sorted(counts.values(), reverse=True))
+    return E, sizes
 
-    Encode a nonempty support by log(L) + log binomial(L, s). All atoms
-    have equal prior weight. Continuous or data-selected mechanism parameters
-    require additional coding; this class only covers a predeclared dictionary.
+
+def category_partition_code_nats(
+    support: Sequence[Coordinate] | frozenset[Coordinate],
+    categories: Mapping[Coordinate, CategoryLabel],
+) -> float:
+    """Exchangeable code for the unlabeled category partition.
+
+    TIDES fixes the unit-concentration CRP/Ewens partition law
+
+        P(c|S) = prod_k (n_k-1)! / E!,
+
+    hence
+
+        L_c = log(E!) - sum_k log((n_k-1)!).
+
+    The code is invariant to category-label renaming.  The concentration is
+    fixed at one by the model definition and is not fitted to the trajectory.
     """
-
-    atom_names: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        names = tuple(str(name) for name in self.atom_names)
-        if not names or any(not name.strip() for name in names):
-            raise ValueError("CandidateLibrary requires nonempty atom names.")
-        if len(set(names)) != len(names):
-            raise ValueError("CandidateLibrary atom names must be unique.")
-        object.__setattr__(self, "atom_names", names)
-
-    @property
-    def n_atoms(self) -> int:
-        return len(self.atom_names)
-
-    @property
-    def search_complexities(self) -> tuple[int, ...]:
-        return (1,) * self.n_atoms
+    E, sizes = _partition_sizes(support, categories)
+    if E == 0:
+        return 0.0
+    return float(lgamma(E+1.0) - sum(lgamma(n) for n in sizes))
 
 
-InteractionLibraryCode = PolynomialLibrary | CandidateLibrary
+def category_partition_summary(
+    support: Sequence[Coordinate] | frozenset[Coordinate],
+    categories: Mapping[Coordinate, CategoryLabel],
+) -> tuple[int, tuple[int, ...]]:
+    _, sizes = _partition_sizes(support, categories)
+    return len(sizes), sizes
 
 
 @dataclass(frozen=True)
-class PolynomialObject:
-    """One genuinely independent polynomial interaction object under H."""
-
-    active_atoms: tuple[int, ...]
-    label: Optional[Hashable] = None
-
-    def __post_init__(self) -> None:
-        atoms = tuple(sorted(set(int(i) for i in self.active_atoms)))
-        if not atoms:
-            raise ValueError("PolynomialObject requires at least one active atom.")
-        if any(i < 0 for i in atoms):
-            raise ValueError("active_atoms must be non-negative indices.")
-        object.__setattr__(self, "active_atoms", atoms)
-
-
-@dataclass(frozen=True)
-class StructuralBlockUpdate:
-    old: StructuralSupportBlock
-    new: StructuralSupportBlock
-
-
-TemporalBlockUpdate = StructuralBlockUpdate
-
-
-@dataclass(frozen=True)
-class ExpressionObjectUpdate:
-    old: Optional[PolynomialObject]
-    new: Optional[PolynomialObject]
-
-    def __post_init__(self) -> None:
-        if self.old is None and self.new is None:
-            raise ValueError("At least one of old/new must be present.")
-
-
-@dataclass(frozen=True)
-class MDLScore:
+class RepresentationDLScore:
+    """Discrete description length of one Step-3 representation."""
     total: float
-    observation: float
-    structural: float
-    expression: float
-    precision: float
-
-    Q: int
-    q_star: Optional[int]
-    relative_residual: float
-    uncertainty_floor: float
-    feasible: bool
-
+    dynamics: float
+    structure: float
+    categories: float
     structural_components: tuple[float, ...]
-    expression_components: tuple[float, ...]
+    n_structural_coordinates: int
+    n_categories: int
+    category_sizes: tuple[int, ...]
 
     @property
     def total_bits(self) -> float:
         return float(self.total / log(2.0))
 
     @property
-    def observation_bits(self) -> float:
-        return float(self.observation / log(2.0))
+    def dynamics_bits(self) -> float:
+        return float(self.dynamics / log(2.0))
 
     @property
-    def structural_bits(self) -> float:
-        return float(self.structural / log(2.0))
+    def structure_bits(self) -> float:
+        return float(self.structure / log(2.0))
 
     @property
-    def expression_bits(self) -> float:
-        return float(self.expression / log(2.0))
-
-    @property
-    def precision_bits(self) -> float:
-        return float(self.precision / log(2.0))
-
-    # Compatibility aliases for the earlier implementation.
-    @property
-    def temporal(self) -> float:
-        return self.structural
-
-    @property
-    def temporal_components(self) -> tuple[float, ...]:
-        return self.structural_components
-
-    @property
-    def temporal_bits(self) -> float:
-        return self.structural_bits
+    def categories_bits(self) -> float:
+        return float(self.categories / log(2.0))
 
 
-@dataclass(frozen=True)
-class MDLDelta:
-    delta_total: Optional[float]
-    delta_observation: Optional[float]
-    delta_structural: float
-    delta_expression: float
-    delta_precision: Optional[float]
-
-    new_Q: int
-    new_q_star: Optional[int]
-    new_relative_residual: Optional[float]
-    new_feasible: Optional[bool]
-
-    exact: bool
-    requires_continuous_refit: bool
-    requires_precision_reprofile: bool
-    provisional_delta_if_q_unchanged: Optional[float]
-
-    @property
-    def delta_total_bits(self) -> Optional[float]:
-        return None if self.delta_total is None else float(self.delta_total / log(2.0))
-
-    @property
-    def delta_temporal(self) -> float:
-        return self.delta_structural
-
-
-def _log_choose(n: int, k: int) -> float:
-    n, k = int(n), int(k)
-    if n < 0 or k < 0 or k > n:
-        return -np.inf
-    if k == 0 or k == n:
-        return 0.0
-    k = min(k, n - k)
-    return float(lgamma(n + 1.0) - lgamma(k + 1.0) - lgamma(n - k + 1.0))
-
-
-def _logdiffexp(log_a: float, log_b: float) -> float:
-    if np.isneginf(log_b):
-        return float(log_a)
-    if not np.isfinite(log_a) or log_b >= log_a:
-        raise ValueError("log-difference requires finite log_a > log_b.")
-    return float(log_a + log1p(-np.exp(log_b - log_a)))
-
-
-def elias_delta_integer_code_length_nats(n: int) -> float:
-    n = int(n)
-    if n < 1:
-        raise ValueError("Universal integer code is defined for n >= 1.")
-    ell = floor(np.log2(n)) + 1
-    bits = floor(np.log2(n)) + 2 * floor(np.log2(ell)) + 1
-    return float(bits * log(2.0))
-
-
-def _structural_block_code(block: StructuralSupportBlock) -> float:
-    M, E = block.candidate_count, block.active_count
-    return float(log(M + 1.0) + _log_choose(M, E))
-
-
-def _polynomial_object_code(obj: PolynomialObject, library: InteractionLibraryCode) -> float:
-    atoms = obj.active_atoms
-    if max(atoms) >= library.n_atoms:
-        raise ValueError("PolynomialObject references an atom outside the library.")
-    s = len(atoms)
-    if isinstance(library, CandidateLibrary):
-        return float(log(library.n_atoms) + _log_choose(library.n_atoms, s))
-    p = max(library.atom_degrees[i] for i in atoms)
-    Lp = library.count_up_to_degree(p)
-    Lprev = library.count_up_to_degree(p - 1)
-    log_all = _log_choose(Lp, s)
-    log_prev = _log_choose(Lprev, s)
-    if np.isneginf(log_all):
-        raise ValueError("Invalid polynomial support count.")
-    log_support = log_all if np.isneginf(log_prev) else _logdiffexp(log_all, log_prev)
-    return float(log(float(library.max_degree)) + log(float(Lp)) + log_support)
-
-
-def _precision_code(Q: int, q_star: Optional[int], integer_code_length: Callable[[int], float]) -> float:
-    Q = int(Q)
-    if Q < 0:
-        raise ValueError("Q must be non-negative.")
-    if Q == 0:
-        if q_star not in (None, 0):
-            raise ValueError("q_star must be None or 0 when Q == 0.")
-        return 0.0
-    if q_star is None or int(q_star) < 1:
-        raise ValueError("A feasible model with Q > 0 requires q_star >= 1.")
-    q = int(q_star)
-    return float(integer_code_length(q) + Q * q * log(2.0))
-
-
-def _observation_code(relative_residual: float, uncertainty_floor: float) -> tuple[float, bool]:
-    rho, eps = float(relative_residual), float(uncertainty_floor)
-    if not np.isfinite(rho) or rho < 0.0:
-        raise ValueError("relative_residual must be finite and non-negative.")
-    if not np.isfinite(eps) or eps < 0.0:
-        raise ValueError("uncertainty_floor must be finite and non-negative.")
-    feasible = bool(rho <= eps * (1.0 + 100.0 * np.finfo(float).eps))
-    return (0.0 if feasible else np.inf), feasible
-
-
-def compute_conditional_mdl(
+def compute_representation_description_length(
     *,
-    structural_blocks: Optional[Sequence[StructuralSupportBlock]] = None,
-    polynomial_objects: Sequence[PolynomialObject],
-    library: InteractionLibraryCode,
-    relative_residual: float,
-    uncertainty_floor: float,
-    q_star: Optional[int],
-    precision_parameter_count: Optional[int] = None,
-    integer_code_length: Callable[[int], float] = elias_delta_integer_code_length_nats,
-    temporal_blocks: Optional[Sequence[StructuralSupportBlock]] = None,
-) -> MDLScore:
-    """Compute conditional MDL for one completely profiled Step-3 candidate."""
-
-    if structural_blocks is not None and temporal_blocks is not None:
-        raise ValueError("Pass structural_blocks or temporal_blocks, not both.")
-    blocks = tuple(structural_blocks if structural_blocks is not None else (temporal_blocks or ()))
-    objects = tuple(polynomial_objects)
-
-    structural_components = tuple(_structural_block_code(b) for b in blocks)
-    expression_components = tuple(_polynomial_object_code(o, library) for o in objects)
-    L_struct = float(sum(structural_components))
-    L_expr = float(sum(expression_components))
-
-    expression_Q = int(sum(len(o.active_atoms) for o in objects))
-    Q = expression_Q if precision_parameter_count is None else int(precision_parameter_count)
-    if Q < 0:
-        raise ValueError("precision_parameter_count must be non-negative.")
-
-    L_obs, feasible = _observation_code(relative_residual, uncertainty_floor)
-    if feasible:
-        L_prec = _precision_code(Q, q_star, integer_code_length)
-        total = float(L_struct + L_expr + L_prec)
-    else:
-        L_prec = np.nan if q_star is None else _precision_code(Q, q_star, integer_code_length)
-        total = np.inf
-
-    return MDLScore(
-        total=float(total),
-        observation=float(L_obs),
-        structural=L_struct,
-        expression=L_expr,
-        precision=float(L_prec),
-        Q=Q,
-        q_star=None if q_star is None else int(q_star),
-        relative_residual=float(relative_residual),
-        uncertainty_floor=float(uncertainty_floor),
-        feasible=bool(feasible),
-        structural_components=structural_components,
-        expression_components=expression_components,
+    dynamics_code_length: float,
+    structural_blocks: Sequence[StructuralSupportBlock],
+    support: Sequence[Coordinate] | frozenset[Coordinate],
+    categories: Mapping[Coordinate, CategoryLabel],
+) -> RepresentationDLScore:
+    """Compute L_rep = L_J + L_S + L_c for an already feasible model."""
+    L_J = float(dynamics_code_length)
+    if L_J < 0.0:
+        raise ValueError("dynamics_code_length must be non-negative.")
+    blocks = tuple(structural_blocks)
+    L_S, components = structural_support_code_nats(blocks)
+    support = frozenset(support)
+    implied_E = sum(b.active_count for b in blocks)
+    if implied_E != len(support):
+        raise ValueError(
+            "Structural block active counts must equal support size: "
+            f"blocks imply {implied_E}, support has {len(support)}."
+        )
+    L_c = category_partition_code_nats(support, categories)
+    K, sizes = category_partition_summary(support, categories)
+    return RepresentationDLScore(
+        total=float(L_J + L_S + L_c),
+        dynamics=L_J,
+        structure=L_S,
+        categories=L_c,
+        structural_components=components,
+        n_structural_coordinates=len(support),
+        n_categories=K,
+        category_sizes=sizes,
     )
 
 
-def compute_mdl_delta(
-    old_score: MDLScore,
+StructuralBlockBuilder = Callable[
+    [frozenset[Coordinate]], Sequence[StructuralSupportBlock]
+]
+
+
+def make_in1_description_length_scorer(
     *,
-    library: InteractionLibraryCode,
-    structural_updates: Sequence[StructuralBlockUpdate] = (),
-    expression_updates: Sequence[ExpressionObjectUpdate] = (),
-    new_relative_residual: Optional[float] = None,
-    new_q_star: Optional[int] = None,
-    new_precision_parameter_count: Optional[int] = None,
-    integer_code_length: Callable[[int], float] = elias_delta_integer_code_length_nats,
-    temporal_updates: Optional[Sequence[StructuralBlockUpdate]] = None,
-) -> MDLDelta:
-    """Incrementally account for one proposed structural/expression move."""
+    dynamics_code_length: float,
+    structural_block_builder: StructuralBlockBuilder,
+) -> Callable[
+    [frozenset[Coordinate], Mapping[Coordinate, CategoryLabel], Any], float
+]:
+    """Adapter with the signature expected by PhysicalCategoryComputation.
 
-    if not isinstance(old_score, MDLScore) or not old_score.feasible or not np.isfinite(old_score.total):
-        raise ValueError("old_score must be a finite feasible MDLScore.")
-    if temporal_updates is not None:
-        if structural_updates:
-            raise ValueError("Pass structural_updates or temporal_updates, not both.")
-        structural_updates = temporal_updates
+    The physical profile argument is deliberately ignored: residual depth,
+    W, and Theta are not part of the discrete representation code.
+    """
+    L_J = float(dynamics_code_length)
+    if L_J < 0.0:
+        raise ValueError("dynamics_code_length must be non-negative.")
 
-    delta_struct = 0.0
-    for u in structural_updates:
-        delta_struct += _structural_block_code(u.new) - _structural_block_code(u.old)
+    def scorer(support, categories, profile) -> float:
+        del profile
+        return compute_representation_description_length(
+            dynamics_code_length=L_J,
+            structural_blocks=tuple(structural_block_builder(frozenset(support))),
+            support=frozenset(support),
+            categories=categories,
+        ).total
+    return scorer
 
-    delta_expr = 0.0
-    delta_Q_expr = 0
-    for u in expression_updates:
-        if u.old is not None:
-            delta_expr -= _polynomial_object_code(u.old, library)
-            delta_Q_expr -= len(u.old.active_atoms)
-        if u.new is not None:
-            delta_expr += _polynomial_object_code(u.new, library)
-            delta_Q_expr += len(u.new.active_atoms)
 
-    new_Q = int(old_score.Q + delta_Q_expr) if new_precision_parameter_count is None else int(new_precision_parameter_count)
-    if new_Q < 0:
-        raise ValueError("Updates imply a negative new_Q.")
-
-    if new_relative_residual is None:
-        delta_obs = None
-        new_feasible = None
-        need_refit = True
-    else:
-        new_obs, new_feasible = _observation_code(new_relative_residual, old_score.uncertainty_floor)
-        delta_obs = float(new_obs)
-        need_refit = False
-
-    if new_Q == 0:
-        resolved_q = None
-        delta_prec = float(-old_score.precision)
-        need_precision = False
-    elif new_q_star is not None:
-        resolved_q = int(new_q_star)
-        delta_prec = float(_precision_code(new_Q, resolved_q, integer_code_length) - old_score.precision)
-        need_precision = False
-    else:
-        resolved_q = None
-        delta_prec = None
-        need_precision = True
-
-    exact = delta_obs is not None and delta_prec is not None
-    if exact:
-        delta_total = np.inf if new_feasible is False else float(delta_obs + delta_struct + delta_expr + delta_prec)
-    else:
-        delta_total = None
-
-    provisional = None
-    if old_score.q_star is not None:
-        new_prec_same_q = 0.0 if new_Q == 0 else _precision_code(new_Q, old_score.q_star, integer_code_length)
-        dp = new_prec_same_q - old_score.precision
-        if delta_obs is None:
-            provisional = float(delta_struct + delta_expr + dp)
-        elif new_feasible is False:
-            provisional = np.inf
-        else:
-            provisional = float(delta_obs + delta_struct + delta_expr + dp)
-
-    return MDLDelta(
-        delta_total=delta_total,
-        delta_observation=delta_obs,
-        delta_structural=float(delta_struct),
-        delta_expression=float(delta_expr),
-        delta_precision=delta_prec,
-        new_Q=new_Q,
-        new_q_star=resolved_q,
-        new_relative_residual=None if new_relative_residual is None else float(new_relative_residual),
-        new_feasible=new_feasible,
-        exact=bool(exact),
-        requires_continuous_refit=bool(need_refit),
-        requires_precision_reprofile=bool(need_precision),
-        provisional_delta_if_q_unchanged=provisional,
+def fixed_candidate_blocks_from_labels(
+    support: Sequence[Coordinate] | frozenset[Coordinate],
+    *,
+    candidate_count_by_block: Mapping[Hashable, int],
+    block_of_coordinate: Callable[[Coordinate], Hashable],
+) -> tuple[StructuralSupportBlock, ...]:
+    """Build support blocks without hard-coding TIDES coordinate labels."""
+    support = frozenset(support)
+    counts = {label: 0 for label in candidate_count_by_block}
+    for g in support:
+        label = block_of_coordinate(g)
+        if label not in counts:
+            raise ValueError(f"Coordinate {g!r} maps to unknown block {label!r}.")
+        counts[label] += 1
+    return tuple(
+        StructuralSupportBlock(
+            candidate_count=int(candidate_count_by_block[label]),
+            active_count=int(counts[label]),
+            label=label,
+        )
+        for label in candidate_count_by_block
     )
 
 
 __all__ = [
-    "StructuralSupportBlock",
-    "TemporalSupportBlock",
-    "PolynomialLibrary",
-    "CandidateLibrary",
-    "InteractionLibraryCode",
-    "PolynomialObject",
-    "StructuralBlockUpdate",
-    "TemporalBlockUpdate",
-    "ExpressionObjectUpdate",
-    "MDLScore",
-    "MDLDelta",
-    "elias_delta_integer_code_length_nats",
-    "compute_conditional_mdl",
-    "compute_mdl_delta",
+    "Coordinate", "CategoryLabel", "StructuralSupportBlock",
+    "TemporalSupportBlock", "RepresentationDLScore", "StructuralBlockBuilder",
+    "log_choose", "uniform_model_index_code_nats", "subset_support_code_nats",
+    "structural_support_code_nats", "category_partition_code_nats",
+    "category_partition_summary", "compute_representation_description_length",
+    "make_in1_description_length_scorer", "fixed_candidate_blocks_from_labels",
 ]

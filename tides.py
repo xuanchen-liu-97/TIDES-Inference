@@ -14,8 +14,8 @@ The public pipeline is
     Step 2  edge-space field-family reconstruction
         (Y, D, Psi, stages) -> B_epsilon
 
-    Step 3  physical factorization + conditional-MDL compression
-        (B_epsilon, H) -> (W, Theta)^*_H
+    Step 3  physical inference over discrete representations (J, S, c)
+        B_epsilon -> dynamics-support enumeration -> in1/in2/in3 -> model archive
 
 This module owns orchestration and trajectory-to-observation preprocessing.  The
 scientific solvers remain in the independent Step modules, while the local
@@ -45,7 +45,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from math import factorial
-from typing import Any, Callable, Literal, Mapping, Optional, Sequence
+from typing import Any, Callable, Hashable, Literal, Mapping, Optional, Protocol, Sequence
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -63,9 +63,21 @@ try:  # package imports
         EdgeSpaceFieldFamily,
         reconstruct_edge_space_family_from_observations,
     )
-    from .step3_physical_compression import (
-        PhysicalCompressionResult,
-        compress_physical_representation,
+    from .edge_space_operators import temporal_blocks_from_family
+    from .step3func_physical_profiling import FixedDynamicsProblem
+    from .mdl_description_length import (
+        StructuralSupportBlock,
+        fixed_candidate_blocks_from_labels,
+        make_in1_description_length_scorer,
+        uniform_model_index_code_nats,
+    )
+    from .step3_physical_inference import (
+        DynamicsSupport,
+        FixedJFactory,
+        CrossJModelCollapseBackend,
+        Step3Config,
+        Step3Result,
+        run_step3,
     )
     from .trajectory_smoothing import SegmentedSmoothingResult, smooth_segmented_trajectory
 except ImportError:  # flat-file imports
@@ -81,9 +93,21 @@ except ImportError:  # flat-file imports
         EdgeSpaceFieldFamily,
         reconstruct_edge_space_family_from_observations,
     )
-    from step3_physical_compression import (
-        PhysicalCompressionResult,
-        compress_physical_representation,
+    from edge_space_operators import temporal_blocks_from_family
+    from step3func_physical_profiling import FixedDynamicsProblem
+    from mdl_description_length import (
+        StructuralSupportBlock,
+        fixed_candidate_blocks_from_labels,
+        make_in1_description_length_scorer,
+        uniform_model_index_code_nats,
+    )
+    from step3_physical_inference import (
+        DynamicsSupport,
+        FixedJFactory,
+        CrossJModelCollapseBackend,
+        Step3Config,
+        Step3Result,
+        run_step3,
     )
     from trajectory_smoothing import SegmentedSmoothingResult, smooth_segmented_trajectory
 
@@ -91,6 +115,92 @@ except ImportError:  # flat-file imports
 FloatArray = NDArray[np.float64]
 IntArray = NDArray[np.int64]
 IntrinsicVectorField = Callable[[FloatArray, FloatArray], ArrayLike]
+
+
+
+@dataclass(frozen=True)
+class Step3FixedDynamicsContext:
+    """Step-2 -> Step-3 bridge for the fixed-dynamics physical hypothesis.
+
+    The context contains only shared, model-independent ingredients.  It does
+    not choose category moves, structural-coverage criteria, a Theta measure,
+    a basin cliff rule, or cross-J model collapse.  Those remain explicit
+    scientific choices of the supplied ``Step3FactoryBuilder``.
+    """
+
+    family: EdgeSpaceFieldFamily
+    problem: FixedDynamicsProblem
+    dynamics_supports: tuple[DynamicsSupport, ...]
+    dynamics_code_length: float
+    candidate_count_by_block: Mapping[Hashable, int]
+
+    @staticmethod
+    def block_of_coordinate(coordinate: Hashable) -> Hashable:
+        if not isinstance(coordinate, tuple) or not coordinate:
+            raise ValueError(
+                "TIDES temporal structural coordinates must be tuples such as "
+                "('baseline', edge) or ('transition', transition, edge)."
+            )
+        if coordinate[0] == "baseline" and len(coordinate) == 2:
+            return ("baseline", 0)
+        if coordinate[0] == "transition" and len(coordinate) == 3:
+            return ("transition", int(coordinate[1]))
+        raise ValueError(f"Unknown TIDES structural coordinate {coordinate!r}.")
+
+    def structural_support_blocks(
+        self,
+        support: frozenset[Hashable],
+    ) -> tuple[StructuralSupportBlock, ...]:
+        return fixed_candidate_blocks_from_labels(
+            support,
+            candidate_count_by_block=self.candidate_count_by_block,
+            block_of_coordinate=self.block_of_coordinate,
+        )
+
+    def make_description_length_scorer(self):
+        """Return the new discrete L_rep(J,S,c) scorer used by in1."""
+        return make_in1_description_length_scorer(
+            dynamics_code_length=self.dynamics_code_length,
+            structural_block_builder=self.structural_support_blocks,
+        )
+
+
+class Step3FactoryBuilder(Protocol):
+    """Construct the fixed-J factory after Step 2 has produced B_epsilon.
+
+    A builder typically binds the first-party physical calculations
+    ``PhysicalCategoryComputation``, ``PhysicalStructuralComputation`` and
+    ``PhysicalBasinParticleComputation`` to the prepared context, while keeping
+    proposal/coverage/prior/stop-rule choices explicit.
+    """
+
+    def __call__(self, context: Step3FixedDynamicsContext) -> FixedJFactory:
+        ...
+
+
+@dataclass(frozen=True)
+class PhysicalModelResult:
+    """User-facing physical representation reconstructed from one Step-3 candidate."""
+
+    dynamics_support: DynamicsSupport
+    lineage_id: int
+    checkpoint_id: int
+    support: frozenset[Hashable]
+    categories: Mapping[Hashable, Hashable]
+
+    W_stages: FloatArray
+    theta: FloatArray
+    B_stages: FloatArray
+    delta_W: FloatArray
+    delta_B: FloatArray
+
+    relative_residual: float
+    description_length: float
+    metadata: Mapping[str, Any]
+
+    @property
+    def candidate_id(self) -> tuple[DynamicsSupport, int, int]:
+        return (self.dynamics_support, self.lineage_id, self.checkpoint_id)
 
 
 # -----------------------------------------------------------------------------
@@ -151,7 +261,12 @@ class TrajectoryPreprocessingResult:
 
 @dataclass(frozen=True)
 class TIDESResult:
-    """Output of the complete three-layer TIDES pipeline."""
+    """Output of the complete three-layer TIDES pipeline.
+
+    New Step 3 may retain multiple fixed-J candidates and, when cross-J collapse
+    is enabled, multiple physical branches.  Therefore the public result no
+    longer assumes that one global ``W``/``Theta`` pair always exists.
+    """
 
     transition_indices: IntArray
     transition_times: FloatArray
@@ -161,9 +276,9 @@ class TIDESResult:
     preprocessing: TrajectoryPreprocessingResult
     interaction_library: PairwiseLocalInteractionLibrary
     step2: EdgeSpaceFieldFamily
-    step3: Optional[PhysicalCompressionResult]
+    step3: Optional[Step3Result]
 
-    physical_hypothesis: Optional[str]
+    dynamics_supports: tuple[DynamicsSupport, ...]
     uncertainty_floor: float
     metadata: Mapping[str, Any]
 
@@ -180,29 +295,94 @@ class TIDESResult:
         return self.step2.reference_delta_B
 
     @property
+    def physical_models(self) -> tuple[PhysicalModelResult, ...]:
+        """All successfully re-profiled archived Step-3 candidates."""
+        if self.step3 is None:
+            return ()
+        models: list[PhysicalModelResult] = []
+        for fixed_j in self.step3.outer1.fixed_j_results:
+            for record in fixed_j.successful_checkpoint_records:
+                state = record.reprofiled_state
+                if state is None:
+                    continue
+                models.append(
+                    _physical_model_from_state(
+                        self.step2,
+                        fixed_j.dynamics_support,
+                        record.lineage_id,
+                        record.checkpoint_id,
+                        state,
+                        metadata={
+                            "selected_for_model_comparison": record.selected_for_model_comparison,
+                            "is_raw_terminal": record.is_raw_terminal,
+                            "deletion_depth": record.deletion_depth,
+                        },
+                    )
+                )
+        return tuple(models)
+
+    @property
+    def selected_physical_models(self) -> tuple[PhysicalModelResult, ...]:
+        """Candidates belonging to selected cross-J branches.
+
+        Empty means either Step 3 did not run, cross-J selection is deliberately
+        pending, or the cross-J selector retained no branch.
+        """
+        if self.step3 is None or self.step3.outer2 is None:
+            return ()
+        selected_ids = set(self.step3.outer2.selected_branch_ids)
+        out: list[PhysicalModelResult] = []
+        for branch in self.step3.outer2.branches:
+            if branch.branch_id not in selected_ids:
+                continue
+            for member in branch.members:
+                out.append(
+                    _physical_model_from_state(
+                        self.step2,
+                        member.dynamics_support,
+                        member.lineage_id,
+                        member.checkpoint_id,
+                        member.state,
+                        metadata={
+                            "cross_j_branch_id": branch.branch_id,
+                            "is_terminal": member.is_terminal,
+                            **dict(member.metadata),
+                        },
+                    )
+                )
+        return tuple(out)
+
+    @property
+    def unique_selected_physical_model(self) -> Optional[PhysicalModelResult]:
+        models = self.selected_physical_models
+        return models[0] if len(models) == 1 else None
+
+    # Backward-friendly convenience accessors.  They return a value only when
+    # the new Step-3 result has exactly one selected representation.
+    @property
     def W_stages(self) -> Optional[FloatArray]:
-        return None if self.step3 is None else self.step3.W_stages
+        model = self.unique_selected_physical_model
+        return None if model is None else model.W_stages
 
     @property
     def theta(self) -> Optional[FloatArray]:
-        return None if self.step3 is None else self.step3.theta
+        model = self.unique_selected_physical_model
+        return None if model is None else model.theta
 
     @property
-    def B_stages(self) -> FloatArray:
-        """Selected physical B when Step 3 ran; otherwise the Step-2 reference."""
-        return (
-            self.step2.reference_B_stages
-            if self.step3 is None
-            else self.step3.B_stages
-        )
+    def B_stages(self) -> Optional[FloatArray]:
+        model = self.unique_selected_physical_model
+        return None if model is None else model.B_stages
 
     @property
-    def delta_B(self) -> FloatArray:
-        return np.diff(self.B_stages, axis=0)
+    def delta_B(self) -> Optional[FloatArray]:
+        model = self.unique_selected_physical_model
+        return None if model is None else model.delta_B
 
     @property
-    def mdl_score(self):
-        return None if self.step3 is None else self.step3.mdl_score
+    def description_length(self) -> Optional[float]:
+        model = self.unique_selected_physical_model
+        return None if model is None else float(model.description_length)
 
 
 # -----------------------------------------------------------------------------
@@ -702,6 +882,167 @@ def build_interaction_library(
 
 
 # -----------------------------------------------------------------------------
+# Step-2 -> Step-3 bridge
+# -----------------------------------------------------------------------------
+
+
+def prepare_step3_fixed_dynamics_context(
+    family: EdgeSpaceFieldFamily,
+    dynamics_supports: Sequence[DynamicsSupport],
+) -> Step3FixedDynamicsContext:
+    """Prepare the shared numerical/DL context consumed by a Step-3 factory.
+
+    This is the only public bridge that translates the canonical Step-2 family
+    into Step-3 structural coordinates.  Step 2 itself remains independent of
+    the physical factorization hypothesis.
+    """
+
+    supports = tuple(dynamics_supports)
+    if not supports:
+        raise ValueError("At least one dynamics support J must be supplied.")
+    if family.is_empty:
+        raise ValueError("Cannot run physical inference on an empty B_epsilon family.")
+
+    y = np.concatenate([np.asarray(design.y, dtype=float) for design in family.designs])
+    structural_blocks = temporal_blocks_from_family(family)
+    problem = FixedDynamicsProblem(
+        y=y,
+        structural_blocks=structural_blocks,
+        uncertainty_floor=float(family.uncertainty_floor),
+    )
+
+    candidate_count_by_block: dict[Hashable, int] = {
+        ("baseline", 0): int(family.n_edges),
+    }
+    for r in range(max(0, int(family.n_stages) - 1)):
+        candidate_count_by_block[("transition", r)] = int(family.n_edges)
+
+    return Step3FixedDynamicsContext(
+        family=family,
+        problem=problem,
+        dynamics_supports=supports,
+        dynamics_code_length=uniform_model_index_code_nats(len(supports)),
+        candidate_count_by_block=candidate_count_by_block,
+    )
+
+
+def _physical_model_from_state(
+    family: EdgeSpaceFieldFamily,
+    dynamics_support: DynamicsSupport,
+    lineage_id: int,
+    checkpoint_id: int,
+    state: Any,
+    *,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> PhysicalModelResult:
+    """Reconstruct W^(r) and B^(r)=W^(r)Theta^T from one profiled state."""
+
+    if state.weights is None or state.theta is None:
+        raise ValueError("A physical model candidate must contain profiled weights and theta.")
+
+    weights = dict(state.weights)
+    baseline = np.zeros(family.n_edges, dtype=float)
+    changes = np.zeros((max(0, family.n_stages - 1), family.n_edges), dtype=float)
+
+    for coordinate, value in weights.items():
+        if not isinstance(coordinate, tuple) or not coordinate:
+            raise ValueError(f"Unknown structural coordinate {coordinate!r}.")
+        if coordinate[0] == "baseline" and len(coordinate) == 2:
+            edge = int(coordinate[1])
+            baseline[edge] = float(value)
+        elif coordinate[0] == "transition" and len(coordinate) == 3:
+            transition = int(coordinate[1])
+            edge = int(coordinate[2])
+            changes[transition, edge] = float(value)
+        else:
+            raise ValueError(f"Unknown structural coordinate {coordinate!r}.")
+
+    W_stages = np.empty((family.n_stages, family.n_edges), dtype=float)
+    W_stages[0] = baseline
+    for r in range(1, family.n_stages):
+        W_stages[r] = W_stages[r - 1] + changes[r - 1]
+
+    theta = np.asarray(state.theta, dtype=float).reshape(-1)
+    if theta.size != family.n_library_atoms:
+        raise ValueError(
+            "Profiled theta has incompatible library dimension: "
+            f"{theta.size} != {family.n_library_atoms}."
+        )
+
+    B_stages = W_stages[:, :, None] * theta[None, None, :]
+    delta_W = np.diff(W_stages, axis=0)
+    delta_B = np.diff(B_stages, axis=0)
+
+    return PhysicalModelResult(
+        dynamics_support=dynamics_support,
+        lineage_id=int(lineage_id),
+        checkpoint_id=int(checkpoint_id),
+        support=frozenset(state.support),
+        categories=dict(state.categories),
+        W_stages=W_stages,
+        theta=theta.copy(),
+        B_stages=B_stages,
+        delta_W=delta_W,
+        delta_B=delta_B,
+        relative_residual=float(state.relative_residual),
+        description_length=float(state.description_length),
+        metadata={**dict(state.metadata), **({} if metadata is None else dict(metadata))},
+    )
+
+
+def _resolve_step3_request(
+    family: EdgeSpaceFieldFamily,
+    *,
+    dynamics_supports: Optional[Sequence[DynamicsSupport]],
+    run_physical_inference: Optional[bool],
+    fixed_j_factory: Optional[FixedJFactory],
+    step3_factory_builder: Optional[Step3FactoryBuilder],
+    cross_j_backend: Optional[CrossJModelCollapseBackend],
+    step3_config: Optional[Step3Config],
+) -> Optional[Step3Result]:
+    any_step3_input = any(
+        value is not None
+        for value in (
+            dynamics_supports,
+            fixed_j_factory,
+            step3_factory_builder,
+            cross_j_backend,
+            step3_config,
+        )
+    )
+    should_run = any_step3_input if run_physical_inference is None else bool(run_physical_inference)
+    if not should_run:
+        return None
+
+    if dynamics_supports is None or not tuple(dynamics_supports):
+        raise ValueError("dynamics_supports is required when Step 3 is enabled.")
+    if step3_config is None:
+        raise ValueError("step3_config is required when Step 3 is enabled.")
+    if fixed_j_factory is not None and step3_factory_builder is not None:
+        raise ValueError("Supply either fixed_j_factory or step3_factory_builder, not both.")
+    if fixed_j_factory is None and step3_factory_builder is None:
+        raise ValueError(
+            "Step 3 requires a fixed_j_factory or a step3_factory_builder.  "
+            "The new inference intentionally does not invent default category proposals, "
+            "coverage certificates, Theta measures, or basin stop rules."
+        )
+
+    supports = tuple(dynamics_supports)
+    if fixed_j_factory is None:
+        context = prepare_step3_fixed_dynamics_context(family, supports)
+        fixed_j_factory = step3_factory_builder(context)
+        if fixed_j_factory is None:
+            raise ValueError("step3_factory_builder returned None.")
+
+    return run_step3(
+        supports,
+        fixed_j_factory,
+        cross_j_backend,
+        config=step3_config,
+    )
+
+
+# -----------------------------------------------------------------------------
 # Step-2/3 lower-level entry point for already prepared observations
 # -----------------------------------------------------------------------------
 
@@ -713,12 +1054,27 @@ def run_tides_from_observations(
     stage_of_sample: Sequence[int],
     *,
     uncertainty_floor: float,
-    physical_hypothesis: str = "fixed_dynamics",
-    run_physical_compression: bool = True,
     step2_kwargs: Optional[Mapping[str, Any]] = None,
-    step3_kwargs: Optional[Mapping[str, Any]] = None,
-) -> tuple[EdgeSpaceFieldFamily, Optional[PhysicalCompressionResult]]:
-    """Run Steps 2--3 when preprocessing has already been performed."""
+    # New Step 3.  None means: run iff any Step-3 setup argument is supplied.
+    run_physical_inference: Optional[bool] = None,
+    dynamics_supports: Optional[Sequence[DynamicsSupport]] = None,
+    fixed_j_factory: Optional[FixedJFactory] = None,
+    step3_factory_builder: Optional[Step3FactoryBuilder] = None,
+    cross_j_backend: Optional[CrossJModelCollapseBackend] = None,
+    step3_config: Optional[Step3Config] = None,
+) -> tuple[EdgeSpaceFieldFamily, Optional[Step3Result]]:
+    """Run Steps 2--3 when preprocessing has already been performed.
+
+    Step 2 always returns the canonical observational family ``B_epsilon``.
+    When Step 3 is enabled, the main module only orchestrates the new physical
+    inference; it does not restore the retired ``mdl_search`` or
+    ``mdl_precision`` pathways.
+
+    ``step3_factory_builder`` is the preferred complete-pipeline hook because
+    it is called *after* Step 2 and receives a prepared
+    ``Step3FixedDynamicsContext`` containing the shared physical-profiling
+    problem and the new discrete-DL structural coding helper.
+    """
 
     s2 = {} if step2_kwargs is None else dict(step2_kwargs)
     forbidden2 = {"Y", "D", "library", "stage_of_sample", "uncertainty_floor"} & set(s2)
@@ -737,18 +1093,14 @@ def run_tides_from_observations(
         **s2,
     )
 
-    if not run_physical_compression:
-        return family, None
-
-    s3 = {} if step3_kwargs is None else dict(step3_kwargs)
-    if "hypothesis" in s3:
-        raise ValueError(
-            "Pass physical_hypothesis through run_tides_from_observations, not step3_kwargs."
-        )
-    physical = compress_physical_representation(
+    physical = _resolve_step3_request(
         family,
-        hypothesis=physical_hypothesis,
-        **s3,
+        dynamics_supports=dynamics_supports,
+        run_physical_inference=run_physical_inference,
+        fixed_j_factory=fixed_j_factory,
+        step3_factory_builder=step3_factory_builder,
+        cross_j_backend=cross_j_backend,
+        step3_config=step3_config,
     )
     return family, physical
 
@@ -763,7 +1115,7 @@ def run_tides(
     t: ArrayLike,
     D: ArrayLike,
     *,
-    # Step 1.  Supplying transition_indices is an explicit oracle/manual bypass.
+    # Step 1. Supplying transition_indices is an explicit oracle/manual bypass.
     transition_indices: Optional[Sequence[int]] = None,
     step1_kwargs: Optional[Mapping[str, Any]] = None,
     # Trajectory -> midpoint vector-field observations.
@@ -786,26 +1138,28 @@ def run_tides(
     library_state_scale: Optional[float] = None,
     interaction_atoms: Optional[Sequence[PairwiseLocalInteractionAtom]] = None,
     check_sampled_swap_equivariance: bool = False,
-    # Step 2 / Step 3.
+    # Step 2.
     step2_kwargs: Optional[Mapping[str, Any]] = None,
-    physical_hypothesis: str = "fixed_dynamics",
-    run_physical_compression: bool = True,
-    step3_kwargs: Optional[Mapping[str, Any]] = None,
+    # Step 3. None means: run iff any Step-3 setup argument is supplied.
+    run_physical_inference: Optional[bool] = None,
+    dynamics_supports: Optional[Sequence[DynamicsSupport]] = None,
+    fixed_j_factory: Optional[FixedJFactory] = None,
+    step3_factory_builder: Optional[Step3FactoryBuilder] = None,
+    cross_j_backend: Optional[CrossJModelCollapseBackend] = None,
+    step3_config: Optional[Step3Config] = None,
 ) -> TIDESResult:
-    """Run the complete three-layer TIDES pipeline from a raw trajectory.
+    """Run the complete TIDES pipeline from a raw trajectory.
 
-    The default path performs Step 1, four-point midpoint state/derivative
-    reconstruction, a 4-vs-6 resolution audit, local-library evaluation, Step 2
-    family reconstruction, and Step 3 physical MDL compression.
+    The trajectory/Step-1/Step-2 path is unchanged.  The old
+    ``step3_physical_compression`` entry point has been removed.  New Step 3 is
+    invoked through ``run_step3`` and may retain multiple J-specific or cross-J
+    physical explanations rather than forcing one global model.
 
-    ``uncertainty_floor`` may be supplied explicitly.  If omitted, the default
-    four-point path uses the resolution-audit estimate
-
-        epsilon = uncertainty_multiplier * resolution_relative_max.
-
-    An explicit floor is required when that audit is unavailable, including
-    the local-polynomial smoothing path. ``smoothing_kwargs`` is forwarded to
-    ``preprocess_trajectory``; its noise gains alone are not an epsilon estimate.
+    No default Step-3 factory is invented here.  That is deliberate: category
+    proposals, structural-coverage certification, the Theta measure used for
+    basin mass, and basin stopping/branching rules are inferential choices, not
+    generic numerical plumbing.  The preferred high-level hook is
+    ``step3_factory_builder(context)``.
     """
 
     X_arr, t_arr = _validate_trajectory(X, t)
@@ -878,12 +1232,16 @@ def run_tides(
         local_library,
         prep.stage_of_observation,
         uncertainty_floor=epsilon,
-        physical_hypothesis=physical_hypothesis,
-        run_physical_compression=run_physical_compression,
         step2_kwargs=step2_kwargs,
-        step3_kwargs=step3_kwargs,
+        run_physical_inference=run_physical_inference,
+        dynamics_supports=dynamics_supports,
+        fixed_j_factory=fixed_j_factory,
+        step3_factory_builder=step3_factory_builder,
+        cross_j_backend=cross_j_backend,
+        step3_config=step3_config,
     )
 
+    tested_J = () if dynamics_supports is None else tuple(dynamics_supports)
     return TIDESResult(
         transition_indices=transitions.copy(),
         transition_times=t_arr[transitions].copy(),
@@ -893,12 +1251,10 @@ def run_tides(
         interaction_library=local_library,
         step2=family,
         step3=physical,
-        physical_hypothesis=(
-            str(physical_hypothesis) if run_physical_compression else None
-        ),
+        dynamics_supports=tested_J,
         uncertainty_floor=epsilon,
         metadata={
-            "architecture": "three_layer_tides",
+            "architecture": "three_layer_tides_new_step3",
             "preprocessing_method": str(preprocessing_method),
             "uncertainty_floor_source": floor_source,
             "library_mode": str(library_mode),
@@ -908,6 +1264,8 @@ def run_tides(
             "n_candidate_edges": int(D_arr.shape[1]),
             "n_stages": int(prep.n_stages),
             "n_library_atoms": int(local_library.n_features),
+            "step3_status": None if physical is None else str(physical.status),
+            "n_tested_dynamics_supports": len(tested_J),
         },
     )
 
@@ -920,6 +1278,9 @@ __all__ = [
     # Complete pipeline.
     "TIDESResult",
     "TrajectoryPreprocessingResult",
+    "PhysicalModelResult",
+    "Step3FixedDynamicsContext",
+    "Step3FactoryBuilder",
     "run_tides",
     "run_tides_from_observations",
     "run",
@@ -934,7 +1295,14 @@ __all__ = [
     # Step 2.
     "EdgeSpaceFieldFamily",
     "reconstruct_edge_space_family_from_observations",
+    # Step 2 -> Step 3 bridge.
+    "prepare_step3_fixed_dynamics_context",
+    "FixedDynamicsProblem",
     # Step 3.
-    "PhysicalCompressionResult",
-    "compress_physical_representation",
+    "DynamicsSupport",
+    "FixedJFactory",
+    "CrossJModelCollapseBackend",
+    "Step3Config",
+    "Step3Result",
+    "run_step3",
 ]

@@ -1,78 +1,126 @@
 """
-TIDES Step 3 inner stage 2: structural support exploration.
+TIDES Step 3 inner stage 2: category-aware fixed-E structural equilibration.
 
-Frozen role
------------
-At fixed dynamics support J, explore the composition of the structural support
-without performing sparsifying compression.
+Scientific role
+---------------
+At fixed dynamics support J and fixed structural cardinality E, explore the
+composition of the structural support without performing irreversible
+compression.  The validated proposal kernel is
 
-Validated core:
-    destroy -> repair proposal -> provisional replacement -> in1 relaxation
+    destroy -> repair -> destroy -> repair
 
-Thus the default move preserves support cardinality:
-    E -> E
+where a repair is a *joint* choice of
 
-Residual / conditional-LS repair gains are proposal signals only. They are not
-truth scores and are never used here as a final model-selection objective.
+    (structural coordinate, weight category),
 
-Optional generalization:
-    persistent fixed-capacity competition -> capacity diagnostic -> birth
-    E -> E + 1
+not a topology-only insertion.  Existing categories are inherited through the
+proposal; a repair may either join an existing category or create one new
+category subject to a small category-growth allowance.  A destroyed coordinate
+may therefore be re-added immediately in a different category.  This is an
+intentional local category release/reassignment move, not a no-op.
 
-Birth is disabled by default because the already-validated J2 path used fixed-E
-replacement only. The hook is present so the generalized algorithm can be
-tested without changing the validated core.
+The proposal geometry is evaluated at the parent shared law Theta.  A complete
+two-exchange leaf must satisfy the TIDES hard observation floor before any
+expensive exact calculation is performed.  Floor-feasible leaves are then
+jointly re-profiled in (z, Theta) and passed through full Step-3 in1 category
+relaxation.
 
-This module intentionally does not implement E -> E-1 compression. That is the
-exclusive responsibility of Step 3 inner stage 3.
+A persistent support archive is used for exploration.  Local residual depth and
+local MDL are proposal/navigation diagnostics only; they are not structural
+truth scores and do not greedily select topology.  In particular, archive
+replacement deliberately excludes description length.  Irreversible E -> E-1
+compression remains the exclusive responsibility of in3.
 
-Shared numerical fitting and conditional-LS geometry are delegated to
-``step3func_physical_profiling``; this file retains only the reversible
-structural-exploration logic and coverage semantics.
+This is the TIDES adaptation of Peixoto's coupled topology/weight-category
+search: topology and category membership remain coupled latent variables, while
+the hard uncertainty set B_epsilon replaces ordinary likelihood differences
+inside the observational tolerance.
 """
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Hashable, Iterable, Mapping, Protocol, Sequence
-import random
+import math
 
-try:
-    from .step3in1_weight_category_distribution import ProfiledState, In1InfeasibleError
-    from .step3func_physical_profiling import (
-        FixedDynamicsProblem,
-        conditional_ls_repair_gain,
-        profile_free_weights_and_dynamics,
+import numpy as np
+
+try:  # package form
+    from .step3in1_weight_category_distribution import (
+        CategoryBackend,
+        In1Config,
+        In1InfeasibleError,
+        PhysicalCategoryComputation,
+        ProfiledState,
+        compact_labels,
+        run_weight_category_distribution,
     )
-except ImportError:
-    from step3in1_weight_category_distribution import ProfiledState, In1InfeasibleError
-    from step3func_physical_profiling import (
-        FixedDynamicsProblem,
-        conditional_ls_repair_gain,
-        profile_free_weights_and_dynamics,
+    from .step3func_physical_profiling import FixedDynamicsProblem
+except ImportError:  # flat-file form
+    from step3in1_weight_category_distribution import (
+        CategoryBackend,
+        In1Config,
+        In1InfeasibleError,
+        PhysicalCategoryComputation,
+        ProfiledState,
+        compact_labels,
+        run_weight_category_distribution,
     )
+    from step3func_physical_profiling import FixedDynamicsProblem
 
 Coordinate = Hashable
+CategoryLabel = Hashable
+
+
+# ---------------------------------------------------------------------------
+# Public state / result types
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TopologyMoveLeg:
+    destroyed_coordinate: Coordinate
+    destroy_rank: int
+    destroy_source: str
+    destroyed_relative_residual: float
+    repaired_coordinate: Coordinate
+    repair_category: int
+    repair_kind: str  # existing_category or new_category
+    repair_rank: int
+    repair_source: str
+    repaired_relative_residual: float
 
 
 @dataclass(frozen=True)
 class RepairProposal:
-    """One destroy-repair proposal.
+    """One complete destroy-repair-destroy-repair fixed-E proposal."""
 
-    score may be the conditional least-squares repair gain G or an equivalent
-    cheap score. It is used only for proposal ordering/screening.
-    """
-
-    removed: Coordinate
-    added: Coordinate
-    score: float
+    support: frozenset[Coordinate]
+    categories: Mapping[Coordinate, int]
+    fixed_theta_relative_residual: float
+    path_score: float
+    legs: tuple[TopologyMoveLeg, TopologyMoveLeg]
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    # Compatibility conveniences for older diagnostics that expected a single
+    # removed/added pair.  They refer to the second leg only and should not be
+    # used to reconstruct the proposal semantics.
+    @property
+    def removed(self) -> Coordinate:
+        return self.legs[-1].destroyed_coordinate
+
+    @property
+    def added(self) -> Coordinate:
+        return self.legs[-1].repaired_coordinate
+
+    @property
+    def score(self) -> float:
+        return -float(self.path_score)
 
 
 @dataclass(frozen=True)
 class BirthProposal:
-    """Optional capacity-expansion proposal, produced only after diagnosis."""
+    """Compatibility placeholder; birth is not part of the validated in2 core."""
 
     added: Coordinate
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -80,18 +128,62 @@ class BirthProposal:
 
 @dataclass(frozen=True)
 class In2Config:
-    max_sweeps: int = 100
-    no_move_patience: int = 3
-    random_seed: int | None = None
-    allow_birth: bool = False
-    recurrence_trigger: int = 2
+    # Persistent-archive search budget.
+    max_sweeps: int = 6
+    proposals_per_parent: int = 12
+
+    # Peixoto-style category-aware destroy/repair kernel.
+    category_growth: int = 2
+    destroy_rank_temperature: float = 10.0
+    repair_rank_temperature: float = 25.0
+    global_tail_probability: float = 0.08
+    ls_rcond: float = 1.0e-11
+
+    # Archive parent mixture.
+    residual_parents: int = 4
+    path_parents: int = 6
+    diversity_parents: int = 2
+    random_tail_parents: int = 1
+    max_archive_size: int | None = None
+
+    # in1 relaxation performed after exact joint profiling of each leaf.
+    in1_max_sweeps: int = 5
+    in1_random_seed: int = 1
+
+    # Reproducibility / phase-boundary diagnostics.
+    random_seed: int | None = 404
     max_representatives: int = 8
-    coverage_check_interval: int = 5
+    coverage_check_interval: int = 1
+
+    # Retained only so older callers fail explicitly instead of silently using
+    # a different algorithm.  Fixed-E in2 does not perform births.
+    allow_birth: bool = False
+
+    def __post_init__(self) -> None:
+        if self.max_sweeps < 0 or self.proposals_per_parent < 1:
+            raise ValueError("invalid in2 sweep/proposal budget.")
+        if self.category_growth < 0:
+            raise ValueError("category_growth must be nonnegative.")
+        if self.destroy_rank_temperature <= 0 or self.repair_rank_temperature <= 0:
+            raise ValueError("rank temperatures must be positive.")
+        if not 0.0 <= self.global_tail_probability <= 1.0:
+            raise ValueError("global_tail_probability must lie in [0,1].")
+        if self.ls_rcond < 0:
+            raise ValueError("ls_rcond must be nonnegative.")
+        if self.max_representatives < 1:
+            raise ValueError("max_representatives must be >= 1.")
+        if self.coverage_check_interval < 1:
+            raise ValueError("coverage_check_interval must be >= 1.")
+        if self.allow_birth:
+            raise ValueError(
+                "Validated in2 is fixed-E. Birth/capacity expansion must be tested "
+                "as a separate extension, not mixed into the reference kernel."
+            )
 
 
 @dataclass(frozen=True)
 class In2Move:
-    kind: str  # replacement or birth
+    kind: str
     before_support: frozenset[Coordinate]
     after_support: frozenset[Coordinate]
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -106,14 +198,6 @@ class In2CandidateFailure:
 
 @dataclass(frozen=True)
 class CoverageAssessment:
-    """Backend certificate for the in2 -> in3 phase boundary.
-
-    ``saturated=True`` means the backend certifies that the currently explored
-    structural region has sufficient coverage for irreversible compression to
-    begin.  This is intentionally distinct from temporary lack of accepted
-    moves or exhaustion of a computational budget.
-    """
-
     saturated: bool
     reason: str = ""
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -121,16 +205,37 @@ class CoverageAssessment:
 
 @dataclass(frozen=True)
 class CoverageCheck:
-    """One explicit structural-coverage assessment performed during in2."""
-
     sweep: int
-    trigger: str  # periodic, stall, or budget_end
+    trigger: str
     support: frozenset[Coordinate]
     assessment: CoverageAssessment
 
 
 @dataclass(frozen=True)
+class TopologyArchiveRecord:
+    state: ProfiledState
+    path_score: float
+    parent_support: frozenset[Coordinate] | None
+    proposal_legs: tuple[TopologyMoveLeg, ...]
+    discovery_sweep: int
+
+
+@dataclass(frozen=True)
+class In2Sweep:
+    sweep: int
+    parents_expanded: int
+    proposals_generated: int
+    floor_feasible_leaves: int
+    exact_candidates: int
+    archive_size: int
+    next_parent_count: int
+    best_relative_residual_ls: float
+    best_checkpoint_description_length: float
+
+
+@dataclass(frozen=True)
 class In2Result:
+    # ``state`` is the best fully relaxed checkpoint by description length.
     state: ProfiledState
     history: tuple[In2Move, ...]
     visited_supports: tuple[frozenset[Coordinate], ...]
@@ -138,26 +243,210 @@ class In2Result:
     candidate_failures: tuple[In2CandidateFailure, ...]
     coverage_status: str
     coverage_checks: tuple[CoverageCheck, ...] = ()
+    archive: tuple[TopologyArchiveRecord, ...] = ()
+    sweep_history: tuple[In2Sweep, ...] = ()
+    best_residual_state: ProfiledState | None = None
+    expanded_supports: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Category/support canonicalisation
+# ---------------------------------------------------------------------------
+
+
+def _ordered_support(
+    problem: FixedDynamicsProblem,
+    support: Sequence[Coordinate] | frozenset[Coordinate],
+) -> tuple[Coordinate, ...]:
+    return tuple(problem.normalise_support(support))
+
+
+def _compact_category_map(
+    problem: FixedDynamicsProblem,
+    support: Sequence[Coordinate] | frozenset[Coordinate],
+    categories: Mapping[Coordinate, CategoryLabel],
+) -> dict[Coordinate, int]:
+    ordered = _ordered_support(problem, support)
+    if set(categories) != set(ordered):
+        missing = set(ordered) - set(categories)
+        extra = set(categories) - set(ordered)
+        raise ValueError(
+            "Category assignment must cover exactly the support. "
+            f"missing={sorted(map(repr, missing))}, extra={sorted(map(repr, extra))}"
+        )
+    mapping: dict[CategoryLabel, int] = {}
+    raw: list[int] = []
+    for g in ordered:
+        label = categories[g]
+        if label not in mapping:
+            mapping[label] = len(mapping)
+        raw.append(mapping[label])
+    lab = compact_labels(raw)
+    return {g: int(k) for g, k in zip(ordered, lab)}
+
+
+def _category_count(
+    problem: FixedDynamicsProblem,
+    support: Sequence[Coordinate] | frozenset[Coordinate],
+    categories: Mapping[Coordinate, CategoryLabel],
+) -> int:
+    cats = _compact_category_map(problem, support, categories)
+    return 0 if not cats else max(cats.values()) + 1
+
+
+def _delete_coordinate(
+    problem: FixedDynamicsProblem,
+    support: Sequence[Coordinate] | frozenset[Coordinate],
+    categories: Mapping[Coordinate, CategoryLabel],
+    coordinate: Coordinate,
+) -> tuple[frozenset[Coordinate], dict[Coordinate, int]]:
+    s = frozenset(support)
+    if coordinate not in s:
+        raise ValueError("destroy coordinate is not active.")
+    s2 = frozenset(g for g in s if g != coordinate)
+    if not s2:
+        raise ValueError("cannot destroy the last active coordinate.")
+    c2 = {g: categories[g] for g in s2}
+    return s2, _compact_category_map(problem, s2, c2)
+
+
+def _insert_coordinate(
+    problem: FixedDynamicsProblem,
+    support: Sequence[Coordinate] | frozenset[Coordinate],
+    categories: Mapping[Coordinate, CategoryLabel],
+    coordinate: Coordinate,
+    category: int,
+) -> tuple[frozenset[Coordinate], dict[Coordinate, int]]:
+    s = frozenset(support)
+    if coordinate in s:
+        raise ValueError("repair coordinate is already active.")
+    c = _compact_category_map(problem, s, categories)
+    K = 0 if not c else max(c.values()) + 1
+    if int(category) < 0 or int(category) > K:
+        raise ValueError("repair category must be existing or exactly one new category.")
+    s2 = frozenset(set(s) | {coordinate})
+    c2: dict[Coordinate, int] = dict(c)
+    c2[coordinate] = int(category)
+    return s2, _compact_category_map(problem, s2, c2)
+
+
+def support_key(
+    problem: FixedDynamicsProblem,
+    support: Sequence[Coordinate] | frozenset[Coordinate],
+) -> tuple[int, ...]:
+    order = {g: i for i, g in enumerate(problem.coordinates)}
+    unknown = [g for g in support if g not in order]
+    if unknown:
+        raise ValueError(f"unknown structural coordinates: {unknown!r}")
+    return tuple(sorted(order[g] for g in set(support)))
+
+
+def support_distance(
+    problem: FixedDynamicsProblem,
+    a: Sequence[Coordinate] | frozenset[Coordinate],
+    b: Sequence[Coordinate] | frozenset[Coordinate],
+) -> int:
+    ka, kb = set(support_key(problem, a)), set(support_key(problem, b))
+    return int(len(ka.symmetric_difference(kb)))
+
+
+# ---------------------------------------------------------------------------
+# Fast fixed-Theta category geometry
+# ---------------------------------------------------------------------------
+
+
+class _FixedThetaTopologyGeometry:
+    """Gram-form exact fixed-Theta profiling under category constraints.
+
+    For a fixed parent Theta this reproduces the same least-squares objective as
+    explicit category-block aggregation, but makes thousands of destroy/repair
+    scans practical for the small Step-3 shell search.
+    """
+
+    def __init__(
+        self,
+        problem: FixedDynamicsProblem,
+        theta: Sequence[float],
+        *,
+        rcond: float = 1.0e-11,
+    ) -> None:
+        self.problem = problem
+        self.theta = np.asarray(theta, dtype=float).reshape(-1)
+        if self.theta.size != problem.n_library_atoms:
+            raise ValueError("theta has the wrong library dimension.")
+        self.rcond = float(rcond)
+        self.coordinates = tuple(problem.coordinates)
+        self.index = {g: i for i, g in enumerate(self.coordinates)}
+        blocks = tuple(problem.structural_blocks[g] for g in self.coordinates)
+        C = np.asarray(problem.linear_cache.matrix(blocks, self.theta), dtype=float)
+        self.G = np.asarray(C.T @ C, dtype=float)
+        self.b = np.asarray(C.T @ problem.y, dtype=float)
+        self.y2 = float(problem.y @ problem.y)
+        self.y_norm = max(float(np.linalg.norm(problem.y)), np.finfo(float).tiny)
+
+    def rho(
+        self,
+        support: Sequence[Coordinate] | frozenset[Coordinate],
+        categories: Mapping[Coordinate, CategoryLabel],
+    ) -> float:
+        ordered = _ordered_support(self.problem, support)
+        cats = _compact_category_map(self.problem, ordered, categories)
+        labels = np.asarray([cats[g] for g in ordered], dtype=int)
+        K = int(labels.max()) + 1 if labels.size else 0
+        if K == 0:
+            return 1.0
+        inds = np.asarray([self.index[g] for g in ordered], dtype=int)
+        H = np.zeros((len(ordered), K), dtype=float)
+        H[np.arange(len(ordered)), labels] = 1.0
+        Gs = self.G[np.ix_(inds, inds)]
+        bs = self.b[inds]
+        A = H.T @ Gs @ H
+        d = H.T @ bs
+        try:
+            # A = D^T D is normally positive definite for the small category
+            # systems encountered here.  Direct solve is exactly the LS normal-
+            # equation solution in the full-rank case and avoids thousands of
+            # repeated SVDs during repair scans.
+            z = np.linalg.solve(A, d)
+        except np.linalg.LinAlgError:
+            z = np.linalg.lstsq(A, d, rcond=self.rcond)[0]
+        rss = max(self.y2 - float(d @ z), 0.0)
+        return float(np.sqrt(rss) / self.y_norm)
+
+
+# ---------------------------------------------------------------------------
+# Proposal sampling
+# ---------------------------------------------------------------------------
+
+
+def _sample_ranked(
+    records: Sequence[tuple[Any, ...]],
+    rng: np.random.Generator,
+    *,
+    rank_temperature: float,
+    global_tail_probability: float,
+) -> tuple[tuple[Any, ...], int, str]:
+    if not records:
+        raise ValueError("cannot sample from an empty ranked list.")
+    if float(rng.random()) < float(global_tail_probability):
+        idx = int(rng.integers(len(records)))
+        return tuple(records[idx]), idx + 1, "global_tail"
+    ranks = np.arange(len(records), dtype=float)
+    weights = np.exp(-ranks / float(rank_temperature))
+    weights /= weights.sum()
+    idx = int(rng.choice(len(records), p=weights))
+    return tuple(records[idx]), idx + 1, "ranked"
 
 
 class StructuralExplorationBackend(Protocol):
-    """Model-specific destroy-first proposal engine.
-
-    The implementation should preserve the tested proposal geometry:
-      1. destroy an active coordinate;
-      2. reprofile the destroyed state, releasing stale categories as needed;
-      3. build repair directions from the destroyed residual;
-      4. return a high-ranked working set PLUS a global stochastic tail.
-
-    No truth labels may be used.
-    """
-
-    def replacement_proposals(
+    def propose_two_exchange(
         self,
         state: ProfiledState,
         *,
-        rng: random.Random,
-    ) -> Iterable[RepairProposal]:
+        rng: np.random.Generator,
+        config: In2Config,
+        category_limit: int,
+    ) -> RepairProposal | None:
         ...
 
     def build_replacement_seed(
@@ -165,22 +454,6 @@ class StructuralExplorationBackend(Protocol):
         state: ProfiledState,
         proposal: RepairProposal,
     ) -> ProfiledState:
-        """Build a provisional E-preserving state before in1 relaxation."""
-        ...
-
-    def choose_replacement(
-        self,
-        current: ProfiledState,
-        candidates: Sequence[tuple[RepairProposal, ProfiledState]],
-        history: Sequence[In2Move],
-        *,
-        rng: random.Random,
-    ) -> int | None:
-        """Choose a navigation move.
-
-        This must NOT default to greedy local MDL or residual-depth ranking.
-        Returning None rejects all currently proposed replacements.
-        """
         ...
 
     def coverage_saturated(
@@ -189,55 +462,17 @@ class StructuralExplorationBackend(Protocol):
         history: Sequence[In2Move],
         visited_supports: Sequence[frozenset[Coordinate]],
     ) -> bool | CoverageAssessment:
-        """Assess whether reversible exploration has sufficient coverage.
-
-        This is a scientific phase-boundary certificate, not a convergence
-        surrogate.  It may return ``True`` only when the backend-specific
-        coverage/capacity diagnostics justify handing the current representative
-        set to irreversible in3 compression.
-        """
         ...
 
 
-# ---------------------------------------------------------------------------
-# First-party physical-profiling implementation
-# ---------------------------------------------------------------------------
-
-
-ReplacementSelector = Callable[
-    [
-        ProfiledState,
-        Sequence[tuple[RepairProposal, ProfiledState]],
-        Sequence[In2Move],
-        random.Random,
-    ],
-    int | None,
-]
 CoverageAssessor = Callable[
-    [
-        ProfiledState,
-        Sequence[In2Move],
-        Sequence[frozenset[Coordinate]],
-    ],
+    [ProfiledState, Sequence[In2Move], Sequence[frozenset[Coordinate]]],
     bool | CoverageAssessment,
 ]
 
 
 class PhysicalStructuralComputation:
-    """Destroy-repair computation using the shared physical profiler.
-
-    Numerical responsibilities are delegated to
-    ``step3func_physical_profiling``:
-
-    * the destroyed support is re-profiled with free structural amplitudes;
-    * inactive repair directions are ranked by the conditional-LS gain G;
-    * an E-preserving replacement seed is jointly re-profiled in (W, Theta).
-
-    Navigation and phase-boundary decisions remain separate strategy choices.
-    By default a feasible replacement is selected uniformly at random (never by
-    local MDL or residual depth), while coverage is *not* certified unless an
-    explicit ``coverage_assessor`` is supplied.
-    """
+    """First-party category-aware destroy-first proposal engine."""
 
     def __init__(
         self,
@@ -245,10 +480,10 @@ class PhysicalStructuralComputation:
         *,
         active_atoms: Sequence[int],
         candidate_coordinates: Sequence[Coordinate] | None = None,
-        shortlist_per_removal: int = 4,
-        global_tail_per_removal: int = 2,
+        category_backend: CategoryBackend | None = None,
+        fixed_description_bits: float = 0.0,
+        fixed_description_bits_fn: Callable[[frozenset[Coordinate]], float] | None = None,
         max_nfev: int = 120,
-        replacement_selector: ReplacementSelector | None = None,
         coverage_assessor: CoverageAssessor | None = None,
     ) -> None:
         self.problem = problem
@@ -256,9 +491,7 @@ class PhysicalStructuralComputation:
         if not self.active_atoms:
             raise ValueError("active_atoms must be non-empty.")
         self.candidate_coordinates = tuple(
-            problem.coordinates
-            if candidate_coordinates is None
-            else candidate_coordinates
+            problem.coordinates if candidate_coordinates is None else candidate_coordinates
         )
         unknown = set(self.candidate_coordinates) - set(problem.coordinates)
         if unknown:
@@ -266,151 +499,242 @@ class PhysicalStructuralComputation:
                 "candidate_coordinates contains unknown entries: "
                 f"{sorted(map(repr, unknown))}"
             )
-        self.shortlist_per_removal = int(shortlist_per_removal)
-        self.global_tail_per_removal = int(global_tail_per_removal)
         self.max_nfev = int(max_nfev)
-        if self.shortlist_per_removal < 0 or self.global_tail_per_removal < 0:
-            raise ValueError("Proposal shortlist/tail sizes must be nonnegative.")
         if self.max_nfev < 1:
             raise ValueError("max_nfev must be >= 1.")
-        self.replacement_selector = replacement_selector
+        self.category_backend = (
+            category_backend
+            if category_backend is not None
+            else PhysicalCategoryComputation(
+                problem,
+                active_atoms=self.active_atoms,
+                fixed_description_bits=float(fixed_description_bits),
+                fixed_description_bits_fn=fixed_description_bits_fn,
+                max_nfev=self.max_nfev,
+            )
+        )
         self.coverage_assessor = coverage_assessor
 
+    def _scan_destroy(
+        self,
+        geometry: _FixedThetaTopologyGeometry,
+        support: frozenset[Coordinate],
+        categories: Mapping[Coordinate, CategoryLabel],
+        *,
+        exclude: Sequence[Coordinate] = (),
+    ) -> list[tuple[float, Coordinate]]:
+        excluded = set(exclude)
+        out: list[tuple[float, Coordinate]] = []
+        for g in _ordered_support(self.problem, support):
+            if g in excluded:
+                continue
+            sd, cd = _delete_coordinate(self.problem, support, categories, g)
+            out.append((geometry.rho(sd, cd), g))
+        return sorted(out, key=lambda x: x[0])
+
+    def _scan_repair(
+        self,
+        geometry: _FixedThetaTopologyGeometry,
+        support: frozenset[Coordinate],
+        categories: Mapping[Coordinate, CategoryLabel],
+        *,
+        category_limit: int,
+    ) -> list[tuple[float, Coordinate, int, str]]:
+        c = _compact_category_map(self.problem, support, categories)
+        K = 0 if not c else max(c.values()) + 1
+        choices = list(range(K))
+        if K < int(category_limit):
+            choices.append(K)
+
+        active = set(support)
+        out: list[tuple[float, Coordinate, int, str]] = []
+        for g in self.candidate_coordinates:
+            if g in active:
+                continue
+            for k in choices:
+                sr, cr = _insert_coordinate(self.problem, support, c, g, int(k))
+                rho = geometry.rho(sr, cr)
+                kind = "existing_category" if int(k) < K else "new_category"
+                out.append((float(rho), g, int(k), kind))
+        return sorted(out, key=lambda x: x[0])
+
+    def _one_leg(
+        self,
+        geometry: _FixedThetaTopologyGeometry,
+        support: frozenset[Coordinate],
+        categories: Mapping[Coordinate, CategoryLabel],
+        *,
+        rng: np.random.Generator,
+        config: In2Config,
+        category_limit: int,
+        exclude_destroy: Sequence[Coordinate] = (),
+    ) -> tuple[frozenset[Coordinate], dict[Coordinate, int], TopologyMoveLeg]:
+        destroy_records = self._scan_destroy(
+            geometry, support, categories, exclude=exclude_destroy
+        )
+        destroy, destroy_rank, destroy_source = _sample_ranked(
+            destroy_records,
+            rng,
+            rank_temperature=config.destroy_rank_temperature,
+            global_tail_probability=config.global_tail_probability,
+        )
+        destroy_rho, destroyed = destroy
+        sd, cd = _delete_coordinate(self.problem, support, categories, destroyed)
+
+        repair_records = self._scan_repair(
+            geometry, sd, cd, category_limit=category_limit
+        )
+        repair, repair_rank, repair_source = _sample_ranked(
+            repair_records,
+            rng,
+            rank_temperature=config.repair_rank_temperature,
+            global_tail_probability=config.global_tail_probability,
+        )
+        repair_rho, repaired, repair_category, repair_kind = repair
+        sr, cr = _insert_coordinate(
+            self.problem, sd, cd, repaired, int(repair_category)
+        )
+        if _category_count(self.problem, sr, cr) > int(category_limit):
+            raise RuntimeError("repair exceeded the category limit.")
+
+        leg = TopologyMoveLeg(
+            destroyed_coordinate=destroyed,
+            destroy_rank=int(destroy_rank),
+            destroy_source=str(destroy_source),
+            destroyed_relative_residual=float(destroy_rho),
+            repaired_coordinate=repaired,
+            repair_category=int(repair_category),
+            repair_kind=str(repair_kind),
+            repair_rank=int(repair_rank),
+            repair_source=str(repair_source),
+            repaired_relative_residual=float(repair_rho),
+        )
+        return sr, cr, leg
+
+    def propose_two_exchange(
+        self,
+        state: ProfiledState,
+        *,
+        rng: np.random.Generator,
+        config: In2Config,
+        category_limit: int,
+    ) -> RepairProposal | None:
+        support0 = frozenset(state.support)
+        if len(support0) < 2:
+            return None
+        categories0 = _compact_category_map(self.problem, support0, state.categories)
+        geometry = _FixedThetaTopologyGeometry(
+            self.problem, state.theta, rcond=config.ls_rcond
+        )
+        try:
+            s1, c1, leg1 = self._one_leg(
+                geometry,
+                support0,
+                categories0,
+                rng=rng,
+                config=config,
+                category_limit=category_limit,
+            )
+            # Historical validated kernel forbids immediately destroying the
+            # group introduced/reintroduced by the first repair.
+            s2, c2, leg2 = self._one_leg(
+                geometry,
+                s1,
+                c1,
+                rng=rng,
+                config=config,
+                category_limit=category_limit,
+                exclude_destroy=(leg1.repaired_coordinate,),
+            )
+        except (ValueError, RuntimeError, np.linalg.LinAlgError):
+            return None
+
+        # Pure category rearrangements are handled by in1.  The in2 leaf must
+        # actually change the topology shell representative.
+        if support_key(self.problem, s2) == support_key(self.problem, support0):
+            return None
+        rho = geometry.rho(s2, c2)
+        eps = float(self.problem.uncertainty_floor)
+        if rho > eps * (1.0 + 2.0e-10):
+            return None
+
+        path_score = float(
+            math.log1p(leg1.destroy_rank)
+            + math.log1p(leg1.repair_rank)
+            + math.log1p(leg2.destroy_rank)
+            + math.log1p(leg2.repair_rank)
+        )
+        return RepairProposal(
+            support=frozenset(s2),
+            categories=dict(c2),
+            fixed_theta_relative_residual=float(rho),
+            path_score=path_score,
+            legs=(leg1, leg2),
+            metadata={
+                "category_aware_repair": True,
+                "two_exchange": True,
+                "global_singleton_release": False,
+            },
+        )
+
+    # Compatibility spelling: now returns stochastic *two-exchange* leaves.
     def replacement_proposals(
         self,
         state: ProfiledState,
         *,
-        rng: random.Random,
+        rng: np.random.Generator,
+        config: In2Config | None = None,
+        category_limit: int | None = None,
     ) -> Iterable[RepairProposal]:
-        support = frozenset(state.support)
-        inactive = tuple(g for g in self.candidate_coordinates if g not in support)
-        if not support or not inactive:
-            return ()
-
-        proposals: list[RepairProposal] = []
-        seen: set[tuple[Coordinate, Coordinate]] = set()
-
-        for removed in support:
-            destroyed = frozenset(set(support) - {removed})
-            if not destroyed:
-                continue
-
-            destroyed_profile = profile_free_weights_and_dynamics(
-                self.problem,
-                destroyed,
-                active_atoms=self.active_atoms,
-                warm_theta=state.theta,
-                max_nfev=self.max_nfev,
-                compute_linear_relaxation=False,
-                include_default_start=True,
+        cfg = In2Config() if config is None else config
+        lim = (
+            _category_count(self.problem, state.support, state.categories)
+            + cfg.category_growth
+            if category_limit is None
+            else int(category_limit)
+        )
+        out: list[RepairProposal] = []
+        for _ in range(int(cfg.proposals_per_parent)):
+            p = self.propose_two_exchange(
+                state, rng=rng, config=cfg, category_limit=lim
             )
-            theta = destroyed_profile.fit.theta
-
-            scored = [
-                conditional_ls_repair_gain(
-                    self.problem,
-                    destroyed,
-                    candidate,
-                    theta,
-                )
-                for candidate in inactive
-            ]
-            scored.sort(key=lambda item: item.gain, reverse=True)
-
-            chosen = list(scored[: self.shortlist_per_removal])
-            remainder = scored[self.shortlist_per_removal :]
-            if self.global_tail_per_removal and remainder:
-                chosen.extend(
-                    rng.sample(
-                        remainder,
-                        k=min(self.global_tail_per_removal, len(remainder)),
-                    )
-                )
-
-            for gain in chosen:
-                key = (removed, gain.coordinate)
-                if key in seen:
-                    continue
-                seen.add(key)
-                proposals.append(
-                    RepairProposal(
-                        removed=removed,
-                        added=gain.coordinate,
-                        score=float(gain.gain),
-                        metadata={
-                            "physical_profiling": True,
-                            "destroyed_relative_residual": float(
-                                destroyed_profile.fit.relative_residual
-                            ),
-                            "repair_residualized_norm_sq": float(
-                                gain.residualized_norm_sq
-                            ),
-                            "repair_score_defined": bool(gain.score_defined),
-                        },
-                    )
-                )
-
-        proposals.sort(key=lambda p: p.score, reverse=True)
-        return tuple(proposals)
+            if p is not None:
+                out.append(p)
+        return tuple(out)
 
     def build_replacement_seed(
         self,
         state: ProfiledState,
         proposal: RepairProposal,
     ) -> ProfiledState:
-        support = (frozenset(state.support) - {proposal.removed}) | {proposal.added}
-        profiled = profile_free_weights_and_dynamics(
-            self.problem,
-            support,
-            active_atoms=self.active_atoms,
-            warm_theta=state.theta,
-            max_nfev=self.max_nfev,
-            compute_linear_relaxation=False,
-            include_default_start=True,
+        """Exact joint (z,Theta) profile preserving proposal categories.
+
+        There is deliberately no global singleton release here.
+        """
+
+        profiled = self.category_backend.profile(
+            frozenset(proposal.support),
+            dict(proposal.categories),
+            warm_start=state,
         )
-
-        # A replacement invalidates old equality-sharing assumptions.  Release
-        # categories completely before handing the seed to in1.
-        ordered = tuple(profiled.support)
-        categories = {
-            g: ("released", i)
-            for i, g in enumerate(ordered)
-        }
-
         return ProfiledState(
             support=frozenset(profiled.support),
-            categories=categories,
-            # This value is intentionally stale: run_in2 immediately calls in1,
-            # whose category scorer replaces it before the candidate can be used.
-            description_length=float(state.description_length),
-            relative_residual=float(profiled.fit.relative_residual),
-            weights=dict(profiled.weights),
-            theta=profiled.fit.theta.copy(),
+            categories=dict(profiled.categories),
+            description_length=float(profiled.description_length),
+            relative_residual=float(profiled.relative_residual),
+            weights=profiled.weights,
+            theta=np.asarray(profiled.theta, dtype=float).copy(),
             metadata={
-                **dict(state.metadata),
-                "physical_profiling": True,
+                **dict(profiled.metadata),
                 "in2_replacement_seed": True,
-                "description_length_stale": True,
-                "removed": proposal.removed,
-                "added": proposal.added,
+                "fixed_theta_leaf_rho": float(
+                    proposal.fixed_theta_relative_residual
+                ),
+                "proposal_path_score": float(proposal.path_score),
+                "proposal_legs": proposal.legs,
+                "global_singleton_release": False,
             },
         )
-
-    def choose_replacement(
-        self,
-        current: ProfiledState,
-        candidates: Sequence[tuple[RepairProposal, ProfiledState]],
-        history: Sequence[In2Move],
-        *,
-        rng: random.Random,
-    ) -> int | None:
-        if not candidates:
-            return None
-        if self.replacement_selector is not None:
-            return self.replacement_selector(current, candidates, history, rng)
-        # Reference navigation is deliberately non-greedy with respect to both
-        # residual depth and description length.
-        return int(rng.randrange(len(candidates)))
 
     def coverage_saturated(
         self,
@@ -426,72 +750,16 @@ class PhysicalStructuralComputation:
         return self.coverage_assessor(state, history, visited_supports)
 
 
+# ---------------------------------------------------------------------------
+# Persistent archive exploration
+# ---------------------------------------------------------------------------
+
+
 In1RelaxFn = Callable[[ProfiledState], ProfiledState]
-CapacityDiagnostic = Callable[
-    [ProfiledState, Sequence[In2Move], random.Random],
-    BirthProposal | None,
-]
-BirthSeedBuilder = Callable[[ProfiledState, BirthProposal], ProfiledState]
 
 
-def _fingerprint(state: ProfiledState) -> frozenset[Coordinate]:
-    return frozenset(state.support)
-
-
-def _assert_replacement(
-    before: ProfiledState,
-    after: ProfiledState,
-    proposal: RepairProposal,
-) -> None:
-    s0 = frozenset(before.support)
-    s1 = frozenset(after.support)
-    if len(s1) != len(s0):
-        raise RuntimeError("in2 replacement must preserve E.")
-    if proposal.removed not in s0:
-        raise RuntimeError("Replacement tried to remove an inactive coordinate.")
-    if proposal.added in s0:
-        raise RuntimeError("Replacement tried to add an already-active coordinate.")
-    expected = (s0 - {proposal.removed}) | {proposal.added}
-    if s1 != expected:
-        raise RuntimeError("Replacement seed does not match destroy-repair proposal.")
-
-
-def _assert_birth(
-    before: ProfiledState,
-    after: ProfiledState,
-    proposal: BirthProposal,
-) -> None:
-    s0 = frozenset(before.support)
-    s1 = frozenset(after.support)
-    if proposal.added in s0:
-        raise RuntimeError("Birth candidate is already active.")
-    if s1 != s0 | {proposal.added}:
-        raise RuntimeError("Birth must add exactly one structural coordinate.")
-
-
-def _representative_states(
-    current: ProfiledState,
-    archive: Mapping[frozenset[Coordinate], ProfiledState],
-    visit_order: Sequence[frozenset[Coordinate]],
-    *,
-    max_representatives: int,
-) -> tuple[ProfiledState, ...]:
-    """Return diverse feasible states without ranking them by residual/MDL."""
-    if max_representatives < 1:
-        raise ValueError("max_representatives must be >= 1.")
-    chosen: list[ProfiledState] = [current]
-    seen = {frozenset(current.support)}
-    if len(chosen) >= max_representatives:
-        return tuple(chosen)
-    for fp in reversed(tuple(visit_order)):
-        if fp in seen or fp not in archive:
-            continue
-        if len(chosen) >= max_representatives:
-            break
-        chosen.append(archive[fp])
-        seen.add(fp)
-    return tuple(chosen)
-
+def _rho_ls(state: ProfiledState) -> float:
+    return float(state.metadata.get("relative_residual_ls", state.relative_residual))
 
 
 def _normalise_coverage_assessment(
@@ -499,260 +767,379 @@ def _normalise_coverage_assessment(
 ) -> CoverageAssessment:
     if isinstance(raw, CoverageAssessment):
         return raw
-    if isinstance(raw, bool):
-        return CoverageAssessment(saturated=raw)
-    raise TypeError(
-        "coverage_saturated() must return bool or CoverageAssessment, "
-        f"got {type(raw).__name__}."
-    )
+    if isinstance(raw, (bool, np.bool_)):
+        return CoverageAssessment(saturated=bool(raw))
+    raise TypeError("coverage_saturated() must return bool or CoverageAssessment.")
 
 
-def _coverage_check(
-    *,
-    backend: StructuralExplorationBackend,
-    state: ProfiledState,
-    history: Sequence[In2Move],
-    visited: Sequence[frozenset[Coordinate]],
-    sweep: int,
-    trigger: str,
-    log: list[CoverageCheck],
-) -> CoverageAssessment:
-    assessment = _normalise_coverage_assessment(
-        backend.coverage_saturated(state, tuple(history), tuple(visited))
-    )
-    log.append(
-        CoverageCheck(
-            sweep=int(sweep),
-            trigger=str(trigger),
-            support=frozenset(state.support),
-            assessment=assessment,
+def _select_archive_parents(
+    problem: FixedDynamicsProblem,
+    archive: Mapping[tuple[int, ...], TopologyArchiveRecord],
+    expanded: set[tuple[int, ...]],
+    rng: np.random.Generator,
+    config: In2Config,
+) -> list[TopologyArchiveRecord]:
+    available = [rec for key, rec in archive.items() if key not in expanded]
+    if not available:
+        return []
+
+    selected: list[TopologyArchiveRecord] = []
+    used: set[tuple[int, ...]] = set()
+
+    def add(rec: TopologyArchiveRecord) -> None:
+        key = support_key(problem, rec.state.support)
+        if key not in used:
+            selected.append(rec)
+            used.add(key)
+
+    for rec in sorted(available, key=lambda r: _rho_ls(r.state))[: config.residual_parents]:
+        add(rec)
+    target = int(config.residual_parents + config.path_parents)
+    for rec in sorted(available, key=lambda r: (r.path_score, _rho_ls(r.state))):
+        if len(selected) >= target:
+            break
+        add(rec)
+
+    for _ in range(int(config.diversity_parents)):
+        remaining = [
+            r for r in available
+            if support_key(problem, r.state.support) not in used
+        ]
+        if not remaining:
+            break
+        if selected:
+            rec = max(
+                remaining,
+                key=lambda r: min(
+                    support_distance(problem, r.state.support, s.state.support)
+                    for s in selected
+                ),
+            )
+        else:
+            rec = remaining[0]
+        add(rec)
+
+    remaining = [
+        r for r in available
+        if support_key(problem, r.state.support) not in used
+    ]
+    for _ in range(min(int(config.random_tail_parents), len(remaining))):
+        idx = int(rng.integers(len(remaining)))
+        add(remaining.pop(idx))
+    return selected
+
+
+def _thin_archive(
+    problem: FixedDynamicsProblem,
+    archive: Mapping[tuple[int, ...], TopologyArchiveRecord],
+    expanded: set[tuple[int, ...]],
+    budget: int,
+) -> tuple[dict[tuple[int, ...], TopologyArchiveRecord], set[tuple[int, ...]]]:
+    vals = list(archive.values())
+    keep: list[TopologyArchiveRecord] = []
+    used: set[tuple[int, ...]] = set()
+
+    def add(rec: TopologyArchiveRecord) -> None:
+        key = support_key(problem, rec.state.support)
+        if key not in used:
+            keep.append(rec)
+            used.add(key)
+
+    for rec in sorted(vals, key=lambda r: _rho_ls(r.state))[: max(1, budget // 3)]:
+        add(rec)
+    for rec in sorted(vals, key=lambda r: (r.path_score, _rho_ls(r.state))):
+        if len(keep) >= max(1, 2 * budget // 3):
+            break
+        add(rec)
+    while len(keep) < budget:
+        remaining = [
+            r for r in vals
+            if support_key(problem, r.state.support) not in used
+        ]
+        if not remaining:
+            break
+        rec = max(
+            remaining,
+            key=lambda r: min(
+                support_distance(problem, r.state.support, s.state.support)
+                for s in keep
+            ) if keep else 0,
         )
-    )
-    return assessment
+        add(rec)
+    new_archive = {support_key(problem, r.state.support): r for r in keep}
+    new_expanded = set(expanded).intersection(new_archive.keys())
+    return new_archive, new_expanded
+
+
+def _representative_states(
+    problem: FixedDynamicsProblem,
+    archive: Mapping[tuple[int, ...], TopologyArchiveRecord],
+    best: ProfiledState,
+    *,
+    max_representatives: int,
+) -> tuple[ProfiledState, ...]:
+    vals = list(archive.values())
+    chosen: list[ProfiledState] = [best]
+    used = {support_key(problem, best.support)}
+    while len(chosen) < max_representatives:
+        remaining = [r.state for r in vals if support_key(problem, r.state.support) not in used]
+        if not remaining:
+            break
+        state = max(
+            remaining,
+            key=lambda r: min(
+                support_distance(problem, r.support, s.support) for s in chosen
+            ),
+        )
+        chosen.append(state)
+        used.add(support_key(problem, state.support))
+    return tuple(chosen)
 
 
 def run_structural_support_exploration(
     initial: ProfiledState,
     backend: StructuralExplorationBackend,
     *,
-    relax_in1: In1RelaxFn,
+    relax_in1: In1RelaxFn | None = None,
     config: In2Config = In2Config(),
-    capacity_diagnostic: CapacityDiagnostic | None = None,
-    build_birth_seed: BirthSeedBuilder | None = None,
+    capacity_diagnostic: Any = None,
+    build_birth_seed: Any = None,
 ) -> In2Result:
-    """Run reversible structural exploration at fixed J.
+    """Run fixed-E category-aware reversible structural exploration.
 
-    The routine never accepts E -> E-1. Ordinary accepted moves are provisional
-    replacements. Optional E -> E+1 birth is available only through the
-    explicit capacity-diagnostic hook.
-
-    Coverage saturation is checked independently of temporary search stalling:
-    periodically during reversible exploration, immediately when stalled, and
-    once more at budget exhaustion. Only an explicit backend certificate can
-    return ``coverage_saturated`` and authorize the in2 -> in3 handoff.
+    ``capacity_diagnostic`` and ``build_birth_seed`` are accepted only for
+    source compatibility with the superseded implementation; the validated
+    fixed-E reference kernel never invokes them.
     """
 
-    if config.max_sweeps < 1:
-        raise ValueError("max_sweeps must be >= 1.")
-    if config.no_move_patience < 1:
-        raise ValueError("no_move_patience must be >= 1.")
-    if config.recurrence_trigger < 2:
-        raise ValueError("recurrence_trigger must be >= 2.")
-    if config.max_representatives < 1:
-        raise ValueError("max_representatives must be >= 1.")
-    if config.coverage_check_interval < 1:
-        raise ValueError("coverage_check_interval must be >= 1.")
-    if config.allow_birth and (capacity_diagnostic is None or build_birth_seed is None):
-        raise ValueError(
-            "Birth is enabled, but capacity_diagnostic/build_birth_seed was not supplied."
+    del capacity_diagnostic, build_birth_seed
+    if config.allow_birth:
+        raise ValueError("birth is not part of the validated fixed-E in2 kernel.")
+    if len(initial.support) < 2:
+        raise ValueError("in2 requires at least two active structural coordinates.")
+    if initial.relative_residual > backend.problem.uncertainty_floor * (1.0 + 2.0e-10):  # type: ignore[attr-defined]
+        raise ValueError("initial in2 state must be hard-floor feasible.")
+
+    problem: FixedDynamicsProblem = backend.problem  # type: ignore[attr-defined]
+    E0 = len(initial.support)
+    initial_categories = _compact_category_map(problem, initial.support, initial.categories)
+    initial_state = ProfiledState(
+        support=frozenset(initial.support),
+        categories=initial_categories,
+        description_length=float(initial.description_length),
+        relative_residual=float(initial.relative_residual),
+        weights=initial.weights,
+        theta=np.asarray(initial.theta, dtype=float).copy(),
+        metadata=dict(initial.metadata),
+    )
+    K0 = _category_count(problem, initial_state.support, initial_state.categories)
+    category_limit = int(K0 + config.category_growth)
+    rng = np.random.default_rng(config.random_seed)
+
+    if relax_in1 is None:
+        if not isinstance(backend, PhysicalStructuralComputation):
+            raise ValueError("relax_in1 is required for a custom in2 backend.")
+
+        def _default_relax(seed: ProfiledState) -> ProfiledState:
+            return run_weight_category_distribution(
+                seed,
+                backend.category_backend,
+                config=In1Config(
+                    uncertainty_floor=problem.uncertainty_floor,
+                    max_sweeps=config.in1_max_sweeps,
+                    random_seed=config.in1_random_seed,
+                ),
+            ).state
+
+        relax = _default_relax
+    else:
+        relax = relax_in1
+
+    key0 = support_key(problem, initial_state.support)
+    archive: dict[tuple[int, ...], TopologyArchiveRecord] = {
+        key0: TopologyArchiveRecord(
+            state=initial_state,
+            path_score=0.0,
+            parent_support=None,
+            proposal_legs=tuple(),
+            discovery_sweep=0,
         )
-
-    rng = random.Random(config.random_seed)
-    current = initial
-    history: list[In2Move] = []
-    visited: list[frozenset[Coordinate]] = [_fingerprint(current)]
-    visit_count: Counter[frozenset[Coordinate]] = Counter(visited)
-    state_archive: dict[frozenset[Coordinate], ProfiledState] = {_fingerprint(current): current}
+    }
+    expanded: set[tuple[int, ...]] = set()
+    parents = [archive[key0]]
+    moves: list[In2Move] = []
     failures: list[In2CandidateFailure] = []
-    coverage_checks: list[CoverageCheck] = []
-    no_move = 0
+    visited: list[frozenset[Coordinate]] = [frozenset(initial_state.support)]
+    checks: list[CoverageCheck] = []
+    sweeps: list[In2Sweep] = []
+    coverage_status = "budget_exhausted"
 
-    for _sweep in range(config.max_sweeps):
-        raw = list(backend.replacement_proposals(current, rng=rng))
-        evaluated: list[tuple[RepairProposal, ProfiledState]] = []
+    for sweep in range(1, int(config.max_sweeps) + 1):
+        parents_expanded = len(parents)
+        generated = 0
+        floor_feasible = 0
+        exact_candidates = 0
 
-        for proposal in raw:
-            seed = backend.build_replacement_seed(current, proposal)
-            _assert_replacement(current, seed, proposal)
-            try:
-                relaxed = relax_in1(seed)
-            except In1InfeasibleError as exc:
-                failures.append(In2CandidateFailure(
-                    kind="replacement_infeasible",
-                    support=frozenset(seed.support),
-                    metadata={"removed": proposal.removed, "added": proposal.added, "reason": str(exc)},
-                ))
-                continue
-            _assert_replacement(current, relaxed, proposal)
-            evaluated.append((proposal, relaxed))
+        for parent in parents:
+            pkey = support_key(problem, parent.state.support)
+            expanded.add(pkey)
+            local_seen: set[tuple[int, ...]] = set()
 
-        idx = backend.choose_replacement(current, evaluated, history, rng=rng)
-        if idx is not None:
-            if idx < 0 or idx >= len(evaluated):
-                raise IndexError("choose_replacement returned an invalid index.")
-            proposal, accepted = evaluated[idx]
-            before = frozenset(current.support)
-            after = frozenset(accepted.support)
-            history.append(
-                In2Move(
-                    kind="replacement",
-                    before_support=before,
-                    after_support=after,
-                    metadata={
-                        "removed": proposal.removed,
-                        "added": proposal.added,
-                        "proposal_score": proposal.score,
-                        **dict(proposal.metadata),
-                    },
+            for proposal_index in range(int(config.proposals_per_parent)):
+                proposal = backend.propose_two_exchange(
+                    parent.state,
+                    rng=rng,
+                    config=config,
+                    category_limit=category_limit,
+                )
+                generated += 1
+                if proposal is None:
+                    continue
+                floor_feasible += 1
+                key = support_key(problem, proposal.support)
+                if key in local_seen:
+                    continue
+                local_seen.add(key)
+
+                try:
+                    seed = backend.build_replacement_seed(parent.state, proposal)
+                    if len(seed.support) != E0:
+                        raise RuntimeError("in2 exact seed changed E.")
+                    if frozenset(seed.support) != frozenset(proposal.support):
+                        raise RuntimeError("exact seed does not match proposal support.")
+                    # Crucial invariant: exact profiling preserves the proposal
+                    # partition instead of resetting all groups to singleton.
+                    if _compact_category_map(problem, seed.support, seed.categories) != _compact_category_map(
+                        problem, proposal.support, proposal.categories
+                    ):
+                        raise RuntimeError("exact seed changed the proposal category partition.")
+                    relaxed = relax(seed)
+                except (In1InfeasibleError, ValueError, RuntimeError) as exc:
+                    failures.append(In2CandidateFailure(
+                        kind="exact_or_in1_infeasible",
+                        support=frozenset(proposal.support),
+                        metadata={
+                            "reason": str(exc),
+                            "legs": proposal.legs,
+                            "fixed_theta_rho": proposal.fixed_theta_relative_residual,
+                        },
+                    ))
+                    continue
+
+                if len(relaxed.support) != E0:
+                    raise RuntimeError("in1 changed E during in2.")
+                if frozenset(relaxed.support) != frozenset(proposal.support):
+                    raise RuntimeError("in1 changed support during in2.")
+                exact_candidates += 1
+
+                record = TopologyArchiveRecord(
+                    state=relaxed,
+                    path_score=float(proposal.path_score),
+                    parent_support=frozenset(parent.state.support),
+                    proposal_legs=proposal.legs,
+                    discovery_sweep=sweep,
+                )
+                old = archive.get(key)
+                # Navigation only: local path quality then LS residual.  MDL is
+                # intentionally absent from this archive replacement rule.
+                if old is None or (
+                    record.path_score,
+                    _rho_ls(relaxed),
+                ) < (
+                    old.path_score,
+                    _rho_ls(old.state),
+                ):
+                    archive[key] = record
+                    visited.append(frozenset(relaxed.support))
+                    moves.append(In2Move(
+                        kind="two_exchange",
+                        before_support=frozenset(parent.state.support),
+                        after_support=frozenset(relaxed.support),
+                        metadata={
+                            "path_score": float(proposal.path_score),
+                            "fixed_theta_rho": float(
+                                proposal.fixed_theta_relative_residual
+                            ),
+                            "legs": proposal.legs,
+                            "n_categories_after_in1": _category_count(
+                                problem, relaxed.support, relaxed.categories
+                            ),
+                        },
+                    ))
+
+        if config.max_archive_size is not None and len(archive) > config.max_archive_size:
+            archive, expanded = _thin_archive(
+                problem, archive, expanded, int(config.max_archive_size)
+            )
+
+        parents = _select_archive_parents(problem, archive, expanded, rng, config)
+        vals = list(archive.values())
+        best_residual = min(vals, key=lambda r: _rho_ls(r.state)).state
+        best_checkpoint = min(vals, key=lambda r: r.state.description_length).state
+        sweeps.append(In2Sweep(
+            sweep=sweep,
+            parents_expanded=int(parents_expanded),
+            proposals_generated=int(generated),
+            floor_feasible_leaves=int(floor_feasible),
+            exact_candidates=int(exact_candidates),
+            archive_size=len(archive),
+            next_parent_count=len(parents),
+            best_relative_residual_ls=float(_rho_ls(best_residual)),
+            best_checkpoint_description_length=float(
+                best_checkpoint.description_length
+            ),
+        ))
+
+        if sweep % int(config.coverage_check_interval) == 0:
+            assessment = _normalise_coverage_assessment(
+                backend.coverage_saturated(
+                    best_checkpoint, tuple(moves), tuple(visited)
                 )
             )
-            current = accepted
-            visited.append(after)
-            visit_count[after] += 1
-            state_archive[after] = accepted
-            no_move = 0
-        else:
-            no_move += 1
-
-        # Optional extension: recurrence only triggers the expensive capacity
-        # diagnostic. It is not itself evidence for birth.
-        if config.allow_birth:
-            fp = _fingerprint(current)
-            if visit_count[fp] >= config.recurrence_trigger:
-                birth = capacity_diagnostic(current, history, rng)  # type: ignore[misc]
-                if birth is not None:
-                    seed = build_birth_seed(current, birth)  # type: ignore[misc]
-                    _assert_birth(current, seed, birth)
-                    try:
-                        accepted = relax_in1(seed)
-                    except In1InfeasibleError as exc:
-                        failures.append(In2CandidateFailure(
-                            kind="birth_infeasible",
-                            support=frozenset(seed.support),
-                            metadata={"added": birth.added, "reason": str(exc)},
-                        ))
-                        accepted = None
-
-                    if accepted is not None:
-                        _assert_birth(current, accepted, birth)
-                        before = frozenset(current.support)
-                        after = frozenset(accepted.support)
-                        history.append(
-                            In2Move(
-                                kind="birth",
-                                before_support=before,
-                                after_support=after,
-                                metadata={"added": birth.added, **dict(birth.metadata)},
-                            )
-                        )
-                        current = accepted
-                        visited.append(after)
-                        visit_count[after] += 1
-                        state_archive[after] = accepted
-                        no_move = 0
-
-        sweep_number = _sweep + 1
-
-        # Coverage is a scientific phase-boundary diagnostic, independent of
-        # whether the reversible Markov/search dynamics are still moving.
-        if sweep_number % config.coverage_check_interval == 0:
-            assessment = _coverage_check(
-                backend=backend,
-                state=current,
-                history=history,
-                visited=visited,
-                sweep=sweep_number,
+            checks.append(CoverageCheck(
+                sweep=sweep,
                 trigger="periodic",
-                log=coverage_checks,
-            )
+                support=frozenset(best_checkpoint.support),
+                assessment=assessment,
+            ))
             if assessment.saturated:
-                return In2Result(
-                    state=current,
-                    history=tuple(history),
-                    visited_supports=tuple(visited),
-                    representative_states=_representative_states(
-                        current, state_archive, visited,
-                        max_representatives=config.max_representatives,
-                    ),
-                    candidate_failures=tuple(failures),
-                    coverage_status="coverage_saturated",
-                    coverage_checks=tuple(coverage_checks),
-                )
+                coverage_status = "coverage_saturated"
+                break
 
-        if no_move >= config.no_move_patience:
-            # Stalling triggers an immediate assessment but does not itself
-            # certify coverage. Avoid duplicating a periodic check on this sweep.
-            if not coverage_checks or coverage_checks[-1].sweep != sweep_number:
-                assessment = _coverage_check(
-                    backend=backend,
-                    state=current,
-                    history=history,
-                    visited=visited,
-                    sweep=sweep_number,
-                    trigger="stall",
-                    log=coverage_checks,
-                )
-            else:
-                assessment = coverage_checks[-1].assessment
-            return In2Result(
-                state=current,
-                history=tuple(history),
-                visited_supports=tuple(visited),
-                representative_states=_representative_states(
-                    current, state_archive, visited,
-                    max_representatives=config.max_representatives,
-                ),
-                candidate_failures=tuple(failures),
-                coverage_status=(
-                    "coverage_saturated"
-                    if assessment.saturated
-                    else "unresolved_stall"
-                ),
-                coverage_checks=tuple(coverage_checks),
-            )
+        if not parents:
+            coverage_status = "archive_exhausted"
+            break
 
-    # Budget exhaustion is not equivalent to incomplete coverage: perform one
-    # final explicit assessment before returning an unresolved result.
-    final_assessment = _coverage_check(
-        backend=backend,
-        state=current,
-        history=history,
-        visited=visited,
-        sweep=config.max_sweeps,
-        trigger="budget_end",
-        log=coverage_checks,
+    vals = list(archive.values())
+    best_checkpoint = min(vals, key=lambda r: r.state.description_length).state
+    best_residual = min(vals, key=lambda r: _rho_ls(r.state)).state
+    representatives = _representative_states(
+        problem,
+        archive,
+        best_checkpoint,
+        max_representatives=config.max_representatives,
     )
     return In2Result(
-        state=current,
-        history=tuple(history),
+        state=best_checkpoint,
+        history=tuple(moves),
         visited_supports=tuple(visited),
-        representative_states=_representative_states(
-            current, state_archive, visited, max_representatives=config.max_representatives
-        ),
+        representative_states=representatives,
         candidate_failures=tuple(failures),
-        coverage_status=(
-            "coverage_saturated"
-            if final_assessment.saturated
-            else "budget_exhausted"
-        ),
-        coverage_checks=tuple(coverage_checks),
+        coverage_status=coverage_status,
+        coverage_checks=tuple(checks),
+        archive=tuple(vals),
+        sweep_history=tuple(sweeps),
+        best_residual_state=best_residual,
+        expanded_supports=len(expanded),
     )
 
 
 run_in2 = run_structural_support_exploration
 
+
 __all__ = [
     "Coordinate",
+    "TopologyMoveLeg",
     "RepairProposal",
     "BirthProposal",
     "In2Config",
@@ -760,14 +1147,15 @@ __all__ = [
     "In2CandidateFailure",
     "CoverageAssessment",
     "CoverageCheck",
+    "TopologyArchiveRecord",
+    "In2Sweep",
     "In2Result",
     "StructuralExplorationBackend",
-    "ReplacementSelector",
     "CoverageAssessor",
     "PhysicalStructuralComputation",
     "In1RelaxFn",
-    "CapacityDiagnostic",
-    "BirthSeedBuilder",
+    "support_key",
+    "support_distance",
     "run_structural_support_exploration",
     "run_in2",
 ]
